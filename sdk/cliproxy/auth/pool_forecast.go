@@ -221,7 +221,7 @@ func BuildPoolForecast(in PoolForecastInput) PoolForecast {
 		Threshold:        limits.threshold,
 		DrainWindowHours: limits.drain.Hours(),
 		Accounts:         make([]PoolForecastAccount, 0, len(in.Accounts)),
-		History:          poolHistoryPoints(history, now),
+		History:          poolHistoryPoints(history, now, poolAccountEmails(in.Accounts)),
 		Alerts:           []PoolAlert{},
 	}
 	if len(history) > 0 {
@@ -518,7 +518,9 @@ func poolPairs(history []PoolSample, fn func(next PoolSample, burn float64)) {
 
 // poolReadingBurn is the burn between two consecutive readings of one window.
 // A fall in used of more than PoolResetDrop, or any fall once the earlier
-// reading's reset has passed, is a reset, and the burn is the new used.
+// reading's reset has passed and the new reading carries a later reset, is a
+// reset, and the burn is the new used. A stale reading of the old window just
+// after its reset keeps the old reset time and does not count as a reset.
 // Otherwise the burn is the change in used, also when the reset time moved, so
 // a small fall from jitter between readings subtracts.
 func poolReadingBurn(prev, next PoolSampleWindow, at time.Time) float64 {
@@ -526,7 +528,7 @@ func poolReadingBurn(prev, next PoolSampleWindow, at time.Time) float64 {
 	if observed.IsZero() {
 		observed = at
 	}
-	resetPassed := !prev.ResetsAt.IsZero() && !prev.ResetsAt.After(observed)
+	resetPassed := !prev.ResetsAt.IsZero() && !prev.ResetsAt.After(observed) && next.ResetsAt.Sub(prev.ResetsAt) > time.Minute
 	if next.Used < prev.Used && (prev.Used-next.Used > PoolResetDrop || resetPassed) {
 		return next.Used
 	}
@@ -650,11 +652,21 @@ func percentile(sorted []float64, p float64) float64 {
 	return sorted[low] + (sorted[high]-sorted[low])*(rank-float64(low))
 }
 
+// poolAccountEmails is the set of the hub's current account emails.
+func poolAccountEmails(accounts []PoolAccount) map[string]bool {
+	emails := make(map[string]bool, len(accounts))
+	for _, account := range accounts {
+		emails[account.Email] = true
+	}
+	return emails
+}
+
 // poolHistoryPoints returns the pool's unused quota at each hour of the last 7
 // days. An account counts at an hour when its latest sample at or before the
 // hour, at any age, is in the pool; each window counts as reset once its reset
-// has passed. Hours before the first sample are left out.
-func poolHistoryPoints(history []PoolSample, now time.Time) []PoolHistoryPoint {
+// has passed. An account the hub no longer holds counts only up to its last
+// sample. Hours before the first sample are left out.
+func poolHistoryPoints(history []PoolSample, now time.Time, current map[string]bool) []PoolHistoryPoint {
 	byEmail := make(map[string][]PoolSample)
 	for _, sample := range history {
 		byEmail[sample.Email] = append(byEmail[sample.Email], sample)
@@ -665,12 +677,15 @@ func poolHistoryPoints(history []PoolSample, now time.Time) []PoolHistoryPoint {
 		at := base.Add(-time.Duration(back) * time.Hour)
 		point := PoolHistoryPoint{At: at}
 		sampled := false
-		for _, samples := range byEmail {
+		for email, samples := range byEmail {
 			sample, ok := poolSampleAt(samples, at)
 			if !ok {
 				continue
 			}
 			sampled = true
+			if !current[email] && at.After(samples[len(samples)-1].At) {
+				continue
+			}
 			if sample.State != PoolSampleInPool || sample.SevenDay == nil {
 				continue
 			}

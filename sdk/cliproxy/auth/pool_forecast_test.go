@@ -419,6 +419,7 @@ func TestPoolReadingBurn(t *testing.T) {
 		{"a fall of more than 0.3 is a reset", PoolSampleWindow{Used: 0.95, ResetsAt: ahead}, PoolSampleWindow{Used: 0.04, ResetsAt: ahead}, 0.04},
 		{"a small fall after the reset is a reset", PoolSampleWindow{Used: 0.2, ResetsAt: passed}, PoolSampleWindow{Used: 0.02, ResetsAt: ahead}, 0.02},
 		{"a rise after a moved reset is its increase", PoolSampleWindow{Used: 0.8, ResetsAt: passed}, PoolSampleWindow{Used: 0.85, ResetsAt: ahead}, 0.05},
+		{"a stale reading of the old window after its reset subtracts", PoolSampleWindow{Used: 0.94, ResetsAt: passed}, PoolSampleWindow{Used: 0.93, ResetsAt: passed}, -0.01},
 	}
 	for _, c := range cases {
 		c.next.ObservedAt = poolNow
@@ -527,6 +528,31 @@ func TestPoolHistoryDropsAnAccountThatNeedsSignIn(t *testing.T) {
 	}
 	if forecast.Pool.Remaining != 0.6 {
 		t.Fatalf("pool remaining = %v, want 0.6", forecast.Pool.Remaining)
+	}
+}
+
+func TestPoolHistoryDropsAnAccountTheHubNoLongerHolds(t *testing.T) {
+	start := poolNow.Add(-6 * time.Hour)
+	deleted := poolNow.Add(-3 * time.Hour)
+	reset := poolNow.Add(48 * time.Hour)
+	serving := poolHeaderAuth("serving@example.com", 0.4, reset, start)
+	leaving := poolHeaderAuth("leaving@example.com", 0.2, reset, start)
+	var history []PoolSample
+	for at := start; !at.After(poolNow); at = at.Add(PoolSampleInterval) {
+		auths := []*Auth{serving}
+		if at.Before(deleted) {
+			auths = append(auths, leaving)
+		}
+		history = append(history, ClaudePoolSamples(auths, at)...)
+	}
+	forecast := BuildPoolForecast(PoolForecastInput{Now: poolNow, Accounts: ClaudePoolAccounts([]*Auth{serving}, poolNow), History: history})
+	if got := poolHistoryRemainingAt(t, forecast, deleted.Add(-time.Hour)); got != 1.4 {
+		t.Fatalf("history before the deletion = %v, want 1.4 from both accounts", got)
+	}
+	for _, at := range []time.Time{deleted, poolNow} {
+		if got := poolHistoryRemainingAt(t, forecast, at); got != 0.6 {
+			t.Fatalf("history at %v = %v, want 0.6 from the serving account only", at, got)
+		}
 	}
 }
 
