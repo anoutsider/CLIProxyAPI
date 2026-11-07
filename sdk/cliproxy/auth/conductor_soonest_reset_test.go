@@ -43,7 +43,7 @@ func runManagerSoonestReset(t *testing.T, affinity bool) {
 		resetIn time.Duration
 	}{
 		lateID: {"0.10", 5 * 24 * time.Hour},
-		soonID: {"0.60", 1 * 24 * time.Hour},
+		soonID: {"0.60", 2 * 24 * time.Hour},
 	}
 	for _, id := range []string{lateID, soonID} {
 		registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: opus}, {ID: fable}})
@@ -83,7 +83,7 @@ func runManagerSoonestReset(t *testing.T, affinity bool) {
 		t.Fatalf("new Opus session went to %s, want %s whose window resets first", got, soonID)
 	}
 
-	SetClaudeUsageWindows(soonID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.95, ResetsAt: time.Now().Add(24 * time.Hour)}})
+	SetClaudeUsageWindows(soonID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.95, ResetsAt: time.Now().Add(48 * time.Hour)}})
 	t.Cleanup(func() { ClearClaudeScopedWindows(soonID) })
 	if got := execute("new-fable", fable); got != lateID {
 		t.Fatalf("new Fable session went to %s, want %s: %s's Fable window is full", got, lateID, soonID)
@@ -94,7 +94,7 @@ func runManagerSoonestReset(t *testing.T, affinity bool) {
 	if !affinity {
 		return
 	}
-	SetClaudeUsageWindows(lateID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.95, ResetsAt: time.Now().Add(24 * time.Hour)}})
+	SetClaudeUsageWindows(lateID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.95, ResetsAt: time.Now().Add(48 * time.Hour)}})
 	t.Cleanup(func() { ClearClaudeScopedWindows(lateID) })
 	if got := execute("new-fable", fable); got != lateID {
 		t.Fatalf("bound Fable session moved to %s, want it to stay bound to %s until a limit is returned", got, lateID)

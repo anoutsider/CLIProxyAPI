@@ -16,6 +16,11 @@ import (
 // receiving new sessions under the soonest-reset strategy.
 const DefaultSoonestResetThreshold = 0.9
 
+// DefaultSoonestResetDrainWindow is how long before its reset a window may be used
+// past the threshold, up to 100%. Quota left at a reset is lost, so near the reset
+// there is nothing to keep in reserve.
+const DefaultSoonestResetDrainWindow = 24 * time.Hour
+
 // soonestResetProbeWindow is how long an account without data keeps its place at
 // the front after it was first tried. A response normally supplies the data well
 // within it; one that does not drops behind the accounts with data.
@@ -130,6 +135,9 @@ type SoonestResetSelector struct {
 	// Threshold is the utilization, from 0 to 1, at which an account stops
 	// receiving new sessions. Zero means DefaultSoonestResetThreshold.
 	Threshold float64
+	// DrainWindow is how long before its reset a window may be used to 100%.
+	// Zero means DefaultSoonestResetDrainWindow; a negative value disables draining.
+	DrainWindow time.Duration
 
 	// now is replaced in tests.
 	now func() time.Time
@@ -145,6 +153,16 @@ func (s *SoonestResetSelector) threshold() float64 {
 		return DefaultSoonestResetThreshold
 	}
 	return s.Threshold
+}
+
+func (s *SoonestResetSelector) drainWindow() time.Duration {
+	if s == nil || s.DrainWindow == 0 {
+		return DefaultSoonestResetDrainWindow
+	}
+	if s.DrainWindow < 0 {
+		return 0
+	}
+	return s.DrainWindow
 }
 
 func (s *SoonestResetSelector) clock() time.Time {
@@ -167,7 +185,7 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 	if s.probed == nil {
 		s.probed = make(map[string]time.Time)
 	}
-	picked, learning := pickSoonestReset(available, model, s.threshold(), now, s.probed)
+	picked, learning := pickSoonestReset(available, model, resetLimits{threshold: s.threshold(), drain: s.drainWindow()}, now, s.probed)
 	if picked != nil && learning {
 		if _, ok := s.probed[picked.ID]; !ok {
 			s.probed[picked.ID] = now
@@ -190,14 +208,30 @@ type resetCandidate struct {
 	used   float64
 	reset  time.Time
 	// modelUsed is the requested model's weekly utilization, or -1 when unknown.
-	modelUsed float64
+	modelUsed  float64
+	modelReset time.Time
 }
 
-func (c resetCandidate) eligible(threshold float64) bool {
-	if c.modelUsed >= threshold {
+// resetLimits are the utilization limits of the soonest-reset strategy.
+type resetLimits struct {
+	threshold float64
+	drain     time.Duration
+}
+
+// limitFor is the utilization limit of a window that resets at reset: the
+// threshold, or 100% within the drain window before the reset.
+func (l resetLimits) limitFor(reset, now time.Time) float64 {
+	if l.drain > 0 && !reset.IsZero() && reset.Sub(now) <= l.drain {
+		return 1
+	}
+	return l.threshold
+}
+
+func (c resetCandidate) eligible(limits resetLimits, now time.Time) bool {
+	if c.modelUsed >= 0 && c.modelUsed >= limits.limitFor(c.modelReset, now) {
 		return false
 	}
-	return !c.known || c.used < threshold
+	return !c.known || c.used < limits.limitFor(c.reset, now)
 }
 
 // fullest is the higher of the seven-day and model window utilizations.
@@ -218,7 +252,7 @@ func (c resetCandidate) remainingPerHour(now time.Time) float64 {
 // its window, or nil when no candidate has any window data. probed holds when
 // each account without data was first tried; entries of accounts with data are
 // removed, so an account whose window resets can be tried again.
-func pickSoonestReset(available []*Auth, model string, threshold float64, now time.Time, probed map[string]time.Time) (*Auth, bool) {
+func pickSoonestReset(available []*Auth, model string, limits resetLimits, now time.Time, probed map[string]time.Time) (*Auth, bool) {
 	for authID, first := range probed {
 		if now.Sub(first) >= soonestResetReprobeInterval {
 			delete(probed, authID)
@@ -242,7 +276,7 @@ func pickSoonestReset(available []*Auth, model string, threshold float64, now ti
 	}
 	eligible := make([]resetCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		if candidate.eligible(threshold) {
+		if candidate.eligible(limits, now) {
 			eligible = append(eligible, candidate)
 		}
 	}
@@ -330,6 +364,7 @@ func resetCandidateFor(auth *Auth, order int, model string, now time.Time) reset
 	}
 	if window, ok := claudeScopedWindowFor(auth.ID, model); ok && window.ResetsAt.After(now) {
 		candidate.modelUsed = window.Utilization
+		candidate.modelReset = window.ResetsAt
 	}
 	return candidate
 }
