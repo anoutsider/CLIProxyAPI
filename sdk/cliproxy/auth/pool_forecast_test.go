@@ -219,3 +219,26 @@ func TestPoolRunsOutAlertFiresWhenAResetComesFirst(t *testing.T) {
 		t.Fatalf("message = %q, want it to contain %q", alert.Message, want)
 	}
 }
+
+func TestPoolDailyBurnsLeaveOutSamplingGaps(t *testing.T) {
+	start := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC).Add(-PoolSampleInterval)
+	now := time.Date(2026, 11, 6, 18, 0, 0, 0, time.UTC)
+	outageFrom := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	outageTo := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	var history []PoolSample
+	for _, sample := range poolHistoryFrom(start, now) {
+		if sample.At.After(outageFrom) && sample.At.Before(outageTo) {
+			continue
+		}
+		history = append(history, sample)
+	}
+	account := PoolAccount{ID: "a", Email: "a@example.com", SevenDay: &ScopedWindow{Utilization: 0.5, ResetsAt: now.Add(5 * 24 * time.Hour)}}
+	forecast := BuildPoolForecast(PoolForecastInput{Now: now, Accounts: []PoolAccount{account}, History: history})
+	burn := forecast.Pool.BurnPerDay
+	if burn.Quiet == nil || *burn.Quiet != 0.1 || *burn.Typical != 0.1 || *burn.Busy != 0.1 {
+		t.Fatalf("burnPerDay = %v, %v, %v; want 0.1 for each kind from the 3 days without a gap", *burn.Quiet, *burn.Typical, *burn.Busy)
+	}
+	if forecast.Accuracy != nil {
+		t.Fatalf("accuracy = %+v for a day without samples, want null", forecast.Accuracy)
+	}
+}

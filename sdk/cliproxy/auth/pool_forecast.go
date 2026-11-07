@@ -454,10 +454,12 @@ func poolPairs(history []PoolSample, fn func(prev, next PoolSample)) {
 }
 
 // poolDays holds the burn of each full UTC day of the history, from first on.
-// A day is full when history began at or before its start and the day has ended.
+// A day is full when history began at or before its start, the day has ended,
+// and no gap of more than poolSampleMaxAge between pool samples overlaps it.
 type poolDays struct {
 	first time.Time
 	burns []float64
+	gaps  []bool
 }
 
 // burn returns the burn of the full day starting at day.
@@ -466,10 +468,24 @@ func (d poolDays) burn(day time.Time) (float64, bool) {
 		return 0, false
 	}
 	index := int(day.Sub(d.first) / (24 * time.Hour))
-	if index >= len(d.burns) || !d.first.Add(time.Duration(index)*24*time.Hour).Equal(day) {
+	if index >= len(d.burns) || d.gaps[index] || !d.first.Add(time.Duration(index)*24*time.Hour).Equal(day) {
 		return 0, false
 	}
 	return d.burns[index], true
+}
+
+// markGap marks the days that overlap the sampling gap (from, to).
+func (d poolDays) markGap(from, to time.Time) {
+	if to.Sub(from) <= poolSampleMaxAge || !to.After(d.first) {
+		return
+	}
+	start := 0
+	if from.After(d.first) {
+		start = int(from.Sub(d.first) / (24 * time.Hour))
+	}
+	for index := start; index < len(d.gaps) && d.first.Add(time.Duration(index)*24*time.Hour).Before(to); index++ {
+		d.gaps[index] = true
+	}
 }
 
 func poolDailyBurns(history []PoolSample, now time.Time) poolDays {
@@ -483,7 +499,12 @@ func poolDailyBurns(history []PoolSample, now time.Time) poolDays {
 	days := poolDays{first: first}
 	if full := int(now.Sub(first) / (24 * time.Hour)); full > 0 {
 		days.burns = make([]float64, full)
+		days.gaps = make([]bool, full)
 	}
+	for i := 1; i < len(history); i++ {
+		days.markGap(history[i-1].At, history[i].At)
+	}
+	days.markGap(history[len(history)-1].At, now)
 	poolPairs(history, func(prev, next PoolSample) {
 		if next.At.Before(first) {
 			return
