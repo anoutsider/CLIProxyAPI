@@ -80,6 +80,7 @@ func TestUsageReadKeyRestrictsManagementRequests(t *testing.T) {
 		{"token in another header", usageKey, http.MethodPost, "/v0/management/api-call", apiCall("claude", "GET", anthropicUsage, "")[:len(apiCall("claude", "GET", anthropicUsage, ""))-2] + `,"Origin":"$TOKEN$"}}`, http.StatusForbidden},
 		{"token in body", usageKey, http.MethodPost, "/v0/management/api-call", apiCall("claude", "GET", anthropicUsage, `,"data":"$TOKEN$"`), http.StatusForbidden},
 		{"token in another authorization form", usageKey, http.MethodPost, "/v0/management/api-call", `{"auth_index":"` + auths["claude"].Index + `","method":"GET","url":"` + anthropicUsage + `","header":{"Authorization":"Basic $TOKEN$"}}`, http.StatusForbidden},
+		{"accept-encoding", usageKey, http.MethodPost, "/v0/management/api-call", `{"auth_index":"` + auths["claude"].Index + `","method":"GET","url":"` + anthropicUsage + `","header":{"Authorization":"Bearer $TOKEN$","Accept-Encoding":"gzip"}}`, http.StatusForbidden},
 		{"credential of another provider", usageKey, http.MethodPost, "/v0/management/api-call", apiCall("codex", "GET", anthropicUsage, ""), http.StatusForbidden},
 		{"auth file download", usageKey, http.MethodGet, "/v0/management/auth-files/download?name=claude-1", "", http.StatusForbidden},
 		{"other route", usageKey, http.MethodGet, "/v0/management/config", "", http.StatusForbidden},
@@ -189,17 +190,27 @@ func TestAPICallUsageReadKeyScrubsTokenAndRefusesRedirect(t *testing.T) {
 	}
 }
 
-func TestUsageReadKeyEqualToSecretKeyIsRefused(t *testing.T) {
-	hashed, errHash := bcrypt.GenerateFromPassword([]byte("same-key"), bcrypt.MinCost)
-	if errHash != nil {
-		t.Fatal(errHash)
+func TestUsageReadKeyEqualToAFullKeyIsRefused(t *testing.T) {
+	hash := func(secret string) string {
+		hashed, errHash := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.MinCost)
+		if errHash != nil {
+			t.Fatal(errHash)
+		}
+		return string(hashed)
 	}
-	cfg := &config.Config{}
-	cfg.RemoteManagement.SecretKey = string(hashed)
-	cfg.RemoteManagement.UsageReadKey = string(hashed)
-	h := &Handler{cfg: cfg, failedAttempts: make(map[string]*attemptInfo)}
-	scope, status, _ := h.authenticateManagementKey("127.0.0.1", true, "same-key")
-	if scope != managementKeyNone || status != http.StatusForbidden {
-		t.Fatalf("scope=%v status=%d, want refusal while the keys collide", scope, status)
+	for name, setup := range map[string]func(*Handler){
+		"secret-key":     func(h *Handler) { h.cfg.RemoteManagement.SecretKey = hash("same-key") },
+		"env secret":     func(h *Handler) { h.cfg.RemoteManagement.SecretKey = hash("other"); h.envSecret = "same-key" },
+		"local password": func(h *Handler) { h.cfg.RemoteManagement.SecretKey = hash("other"); h.localPassword = "same-key" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := &Handler{cfg: &config.Config{}, failedAttempts: make(map[string]*attemptInfo)}
+			h.cfg.RemoteManagement.UsageReadKey = hash("same-key")
+			setup(h)
+			scope, status, _ := h.authenticateManagementKey("127.0.0.1", true, "same-key")
+			if scope != managementKeyNone || status != http.StatusForbidden {
+				t.Fatalf("scope=%v status=%d, want refusal while the keys collide", scope, status)
+			}
+		})
 	}
 }
