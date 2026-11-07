@@ -280,3 +280,27 @@ func TestPrepareConfigFileForUploadRefusesPlaintextKeptByReferences(t *testing.T
 		})
 	}
 }
+
+func TestUsageReadKeyIsHashedLikeSecretKey(t *testing.T) {
+	const content = "management:\n  secret-key: full-plaintext\n  usage-read-key: " + uploadTestPlaintextSecret + "\n"
+
+	loaded := writeUploadTestConfig(t, content)
+	cfg, errLoad := LoadConfig(loaded)
+	if errLoad != nil {
+		t.Fatalf("LoadConfig() error = %v", errLoad)
+	}
+	if errCompare := bcrypt.CompareHashAndPassword([]byte(cfg.RemoteManagement.UsageReadKey), []byte(uploadTestPlaintextSecret)); errCompare != nil {
+		t.Fatalf("loaded usage-read-key %q is not the bcrypt hash of the plaintext", cfg.RemoteManagement.UsageReadKey)
+	}
+	if saved := readUploadTestConfig(t, loaded); strings.Contains(saved, uploadTestPlaintextSecret) || strings.Contains(saved, "full-plaintext") {
+		t.Fatalf("LoadConfig left a plaintext key in the file:\n%s", saved)
+	}
+
+	uploaded := writeUploadTestConfig(t, content)
+	if errPrepare := PrepareConfigFileForUpload(uploaded); errPrepare != nil {
+		t.Fatalf("PrepareConfigFileForUpload() error = %v", errPrepare)
+	}
+	if saved := readUploadTestConfig(t, uploaded); strings.Contains(saved, uploadTestPlaintextSecret) || strings.Contains(saved, "full-plaintext") {
+		t.Fatalf("PrepareConfigFileForUpload left a plaintext key in the file:\n%s", saved)
+	}
+}

@@ -149,7 +149,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 				if cooldownsKnown {
 					entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
 				}
-				files = append(files, entry)
+				files = append(files, usageReadAuthFileEntry(c, entry))
 			}
 		}
 		c.JSON(200, authFilesListResponse(observedAt, files, pagination, total, end))
@@ -165,7 +165,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 			if cooldownsKnown {
 				entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
 			}
-			files = append(files, entry)
+			files = append(files, usageReadAuthFileEntry(c, entry))
 		}
 	}
 	sort.Slice(files, func(i, j int) bool {
@@ -478,7 +478,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 			}
 		}
 
-		files = append(files, fileData)
+		files = append(files, usageReadAuthFileEntry(c, fileData))
 	}
 	c.JSON(200, authFilesListResponse(observedAt, files, pagination, total, end))
 }

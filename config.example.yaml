@@ -108,6 +108,9 @@ management:
   # Leave empty to disable the Management API entirely (404 for /v0/management and /v8/management routes).
   secret-key: ""
 
+  # Read-only key for usage display (hashed on startup like secret-key); it may only call GET /v0/management/auth-files and GET api-calls to the Claude and Codex usage URLs. Empty disables it.
+  usage-read-key: ""
+
   # Disable the bundled management control panel asset download and HTTP route when true.
   disable-control-panel: false
 
