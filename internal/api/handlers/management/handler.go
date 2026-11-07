@@ -454,6 +454,19 @@ func (h *Handler) authenticateManagementKey(clientIP string, localClient bool, p
 		return managementKeyNone, http.StatusUnauthorized, "missing management key"
 	}
 
+	// A usage read key that equals any full credential would hand full access to
+	// whoever holds the read key, so neither is accepted until they differ.
+	if usageReadHash != "" && bcrypt.CompareHashAndPassword([]byte(usageReadHash), []byte(provided)) == nil {
+		collides := (envSecret != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(envSecret)) == 1) ||
+			(h.localPassword != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(h.localPassword)) == 1) ||
+			(secretHash != "" && bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) == nil)
+		if collides {
+			return managementKeyNone, http.StatusForbidden, "usage-read-key must differ from every full management key"
+		}
+		reset()
+		return managementKeyUsageRead, 0, ""
+	}
+
 	if localClient {
 		if lp := h.localPassword; lp != "" {
 			if subtle.ConstantTimeCompare([]byte(provided), []byte(lp)) == 1 {
@@ -469,18 +482,8 @@ func (h *Handler) authenticateManagementKey(clientIP string, localClient bool, p
 	}
 
 	if secretHash != "" && bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) == nil {
-		// A usage read key equal to the full key would hand full access to whoever
-		// holds the read key, so neither is accepted until they differ.
-		if usageReadHash != "" && bcrypt.CompareHashAndPassword([]byte(usageReadHash), []byte(provided)) == nil {
-			return managementKeyNone, http.StatusForbidden, "usage-read-key must differ from secret-key"
-		}
 		reset()
 		return managementKeyFull, 0, ""
-	}
-
-	if usageReadHash != "" && bcrypt.CompareHashAndPassword([]byte(usageReadHash), []byte(provided)) == nil {
-		reset()
-		return managementKeyUsageRead, 0, ""
 	}
 
 	fail()

@@ -87,7 +87,8 @@ func (h *Handler) usageReadAPICallAllowed(c *gin.Context) bool {
 			}
 			continue
 		}
-		if strings.Contains(value, "$TOKEN$") {
+		// An encoded reply could not be scrubbed of an echoed token.
+		if strings.Contains(value, "$TOKEN$") || strings.EqualFold(key, "accept-encoding") {
 			return false
 		}
 	}

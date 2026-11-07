@@ -239,6 +239,10 @@ func (h *Handler) APICall(c *gin.Context) {
 	}
 
 	responseHeader, responseBody := resp.Header, string(respBody)
+	if usageReadKey && !resp.Uncompressed && resp.Header.Get("Content-Encoding") != "" && !strings.EqualFold(resp.Header.Get("Content-Encoding"), "identity") {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "encoded response refused for the usage read key"})
+		return
+	}
 	if usageReadKey {
 		responseHeader = make(http.Header, len(resp.Header))
 		for key, values := range resp.Header {
