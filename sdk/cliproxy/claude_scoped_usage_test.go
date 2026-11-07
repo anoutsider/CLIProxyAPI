@@ -184,3 +184,19 @@ func TestClaudeScopedUsagePollerRetainForgetsRemovedAccounts(t *testing.T) {
 		t.Fatalf("poll state of a kept account was dropped")
 	}
 }
+
+func TestNormalizedRoutingReadsDrainWindow(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Routing.Strategy = "soonest-reset"
+	if state := normalizedRoutingRuntimeState(cfg); state.soonestResetDrainWindow != 0 {
+		t.Fatalf("unset drain window = %v, want 0 (selector default)", state.soonestResetDrainWindow)
+	}
+	cfg.Routing.SoonestResetDrainWindow = "6h"
+	if state := normalizedRoutingRuntimeState(cfg); state.soonestResetDrainWindow != 6*time.Hour {
+		t.Fatalf("drain window = %v, want 6h", state.soonestResetDrainWindow)
+	}
+	cfg.Routing.SoonestResetDrainWindow = "0s"
+	if state := normalizedRoutingRuntimeState(cfg); state.soonestResetDrainWindow >= 0 {
+		t.Fatalf("0s drain window = %v, want disabled (negative)", state.soonestResetDrainWindow)
+	}
+}

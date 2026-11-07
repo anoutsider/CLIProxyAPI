@@ -52,7 +52,7 @@ func TestSoonestResetSelectorPicksSoonestResetWithRoom(t *testing.T) {
 func TestSoonestResetSelectorSkipsAccountAtThreshold(t *testing.T) {
 	t.Parallel()
 	got := pickSoonest(t, &SoonestResetSelector{}, "claude-opus-5-5",
-		soonestResetAuth("almost-full", "0.92", 1*24*time.Hour),
+		soonestResetAuth("almost-full", "0.92", 2*24*time.Hour),
 		soonestResetAuth("later", "0.20", 3*24*time.Hour),
 	)
 	if got != "later" {
@@ -63,7 +63,7 @@ func TestSoonestResetSelectorSkipsAccountAtThreshold(t *testing.T) {
 func TestSoonestResetSelectorHonoursConfiguredThreshold(t *testing.T) {
 	t.Parallel()
 	got := pickSoonest(t, &SoonestResetSelector{Threshold: 0.5}, "claude-opus-5-5",
-		soonestResetAuth("half", "0.6", 1*24*time.Hour),
+		soonestResetAuth("half", "0.6", 2*24*time.Hour),
 		soonestResetAuth("later", "0.1", 3*24*time.Hour),
 	)
 	if got != "later" {
@@ -72,9 +72,9 @@ func TestSoonestResetSelectorHonoursConfiguredThreshold(t *testing.T) {
 }
 
 func TestSoonestResetSelectorSkipsAccountWhoseModelWindowIsFull(t *testing.T) {
-	soon := soonestResetAuth("fable-full", "0.30", 1*24*time.Hour)
+	soon := soonestResetAuth("fable-full", "0.30", 2*24*time.Hour)
 	later := soonestResetAuth("fable-room", "0.40", 3*24*time.Hour)
-	SetClaudeUsageWindows(soon.ID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.95, ResetsAt: soonestResetNow.Add(24 * time.Hour)}})
+	SetClaudeUsageWindows(soon.ID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.95, ResetsAt: soonestResetNow.Add(48 * time.Hour)}})
 	t.Cleanup(func() { ClearClaudeScopedWindows(soon.ID) })
 
 	if got := pickSoonest(t, &SoonestResetSelector{}, "claude-fable-5-1", soon, later); got != "fable-room" {
@@ -137,7 +137,7 @@ func TestSoonestResetSelectorTreatsPassedResetAsUnknown(t *testing.T) {
 func TestSoonestResetSelectorUsesLeastUsedWhenAllAreFull(t *testing.T) {
 	t.Parallel()
 	got := pickSoonest(t, &SoonestResetSelector{}, "claude-opus-5-5",
-		soonestResetAuth("a-fullest", "0.99", 1*24*time.Hour),
+		soonestResetAuth("a-fullest", "0.99", 2*24*time.Hour),
 		soonestResetAuth("b-least", "0.91", 5*24*time.Hour),
 	)
 	if got != "b-least" {
@@ -195,9 +195,9 @@ func TestSoonestResetSelectorRotatesWhenNoAccountHasData(t *testing.T) {
 }
 
 func TestSoonestResetSelectorAllFullFallbackCountsModelWindow(t *testing.T) {
-	fableFull := soonestResetAuth("a-fable-full", "0.10", 1*24*time.Hour)
+	fableFull := soonestResetAuth("a-fable-full", "0.10", 2*24*time.Hour)
 	other := soonestResetAuth("b-other", "0.50", 3*24*time.Hour)
-	SetClaudeUsageWindows(fableFull.ID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.99, ResetsAt: soonestResetNow.Add(24 * time.Hour)}})
+	SetClaudeUsageWindows(fableFull.ID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.99, ResetsAt: soonestResetNow.Add(48 * time.Hour)}})
 	SetClaudeUsageWindows(other.ID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.91, ResetsAt: soonestResetNow.Add(3 * 24 * time.Hour)}})
 	t.Cleanup(func() { ClearClaudeScopedWindows(fableFull.ID); ClearClaudeScopedWindows(other.ID) })
 
@@ -265,15 +265,58 @@ func TestSoonestResetSelectorProbeWindowExpires(t *testing.T) {
 
 // When both sources hold the seven-day window, the newer one decides.
 func TestSoonestResetSelectorUsesNewerOfHeaderAndPolledWindow(t *testing.T) {
-	stale := soonestResetAuth("a-stale-header", "0.40", 1*24*time.Hour)
+	stale := soonestResetAuth("a-stale-header", "0.40", 2*24*time.Hour)
 	stale.Quota.ObservedAt = soonestResetNow.Add(-72 * time.Hour)
 	other := soonestResetAuth("b-other", "0.50", 3*24*time.Hour)
 	other.Quota.ObservedAt = soonestResetNow.Add(-time.Minute)
-	SetClaudeUsageWindows(stale.ID, &ScopedWindow{Utilization: 0.93, ResetsAt: soonestResetNow.Add(24 * time.Hour), ObservedAt: soonestResetNow.Add(-10 * time.Minute)}, nil)
+	SetClaudeUsageWindows(stale.ID, &ScopedWindow{Utilization: 0.93, ResetsAt: soonestResetNow.Add(48 * time.Hour), ObservedAt: soonestResetNow.Add(-10 * time.Minute)}, nil)
 	SetClaudeUsageWindows(other.ID, &ScopedWindow{Utilization: 0.99, ResetsAt: soonestResetNow.Add(3 * 24 * time.Hour), ObservedAt: soonestResetNow.Add(-2 * time.Hour)}, nil)
 	t.Cleanup(func() { ClearClaudeScopedWindows(stale.ID); ClearClaudeScopedWindows(other.ID) })
 
 	if got := pickSoonest(t, &SoonestResetSelector{}, "claude-opus-5-5", stale, other); got != "b-other" {
 		t.Fatalf("picked %q, want b-other: a-stale-header's newer poll says 93%% and b-other's newer header says 50%%", got)
+	}
+}
+
+// Quota left at a reset is lost, so within the drain window an account may be used
+// past the threshold, up to 100%.
+func TestSoonestResetSelectorDrainsAccountBeforeItsReset(t *testing.T) {
+	t.Parallel()
+	near := func() *Auth { return soonestResetAuth("a-near-reset", "0.95", 12*time.Hour) }
+	fresh := func() *Auth { return soonestResetAuth("b-fresh", "0.10", 4*24*time.Hour) }
+	if got := pickSoonest(t, &SoonestResetSelector{}, "claude-opus-5-5", near(), fresh()); got != "a-near-reset" {
+		t.Fatalf("picked %q, want a-near-reset drained before its reset", got)
+	}
+	if got := pickSoonest(t, &SoonestResetSelector{}, "claude-opus-5-5", soonestResetAuth("a-full", "1.0", 12*time.Hour), fresh()); got != "b-fresh" {
+		t.Fatalf("picked %q, want b-fresh: an account at 100%% has nothing left to drain", got)
+	}
+	if got := pickSoonest(t, &SoonestResetSelector{DrainWindow: -1}, "claude-opus-5-5", near(), fresh()); got != "b-fresh" {
+		t.Fatalf("picked %q, want b-fresh with draining disabled", got)
+	}
+	if got := pickSoonest(t, &SoonestResetSelector{DrainWindow: 6 * time.Hour}, "claude-opus-5-5", near(), fresh()); got != "b-fresh" {
+		t.Fatalf("picked %q, want b-fresh: its reset is outside a 6 hour drain window", got)
+	}
+}
+
+// The model window drains by its own reset time, never by the seven-day one.
+func TestSoonestResetSelectorDrainsModelWindowBeforeItsReset(t *testing.T) {
+	cases := []struct {
+		name                 string
+		sevenDayReset, fable time.Duration
+		want                 string
+	}{
+		{"fable resets within the drain window", 3 * 24 * time.Hour, 12 * time.Hour, "a-near"},
+		{"only the seven-day window resets within it", 12 * time.Hour, 3 * 24 * time.Hour, "b-fresh"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			near := soonestResetAuth("a-near", "0.40", tc.sevenDayReset)
+			fresh := soonestResetAuth("b-fresh", "0.10", 4*24*time.Hour)
+			SetClaudeUsageWindows(near.ID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.95, ResetsAt: soonestResetNow.Add(tc.fable)}})
+			t.Cleanup(func() { ClearClaudeScopedWindows(near.ID) })
+			if got := pickSoonest(t, &SoonestResetSelector{}, "claude-fable-5-1", near, fresh); got != tc.want {
+				t.Fatalf("picked %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

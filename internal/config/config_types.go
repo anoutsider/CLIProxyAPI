@@ -542,6 +542,10 @@ type RoutingConfig struct {
 	// receiving new sessions under the "soonest-reset" strategy. Default: 0.9.
 	SoonestResetThreshold float64 `yaml:"soonest-reset-threshold,omitempty" json:"soonest-reset-threshold,omitempty"`
 
+	// SoonestResetDrainWindow is how long before its reset an account may be used past
+	// SoonestResetThreshold, up to 100%. Default: "24h". "0s" or a negative duration disables it.
+	SoonestResetDrainWindow string `yaml:"soonest-reset-drain-window,omitempty" json:"soonest-reset-drain-window,omitempty"`
+
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
 	// followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
