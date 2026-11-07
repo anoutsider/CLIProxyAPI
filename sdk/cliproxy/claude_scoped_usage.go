@@ -205,7 +205,7 @@ func fetchClaudeUsage(ctx context.Context, cfg *config.Config, auth *coreauth.Au
 	if err != nil {
 		return result, err
 	}
-	result.account, result.windows, err = parseClaudeUsageWindows(body)
+	result.account, result.windows, err = parseClaudeUsageWindows(body, time.Now())
 	return result, err
 }
 
@@ -219,7 +219,7 @@ func parseRetryAfterSeconds(value string) time.Duration {
 
 // parseClaudeUsageWindows reads the limits of a usage response: the account-wide
 // "weekly_all" window and one "weekly_scoped" window per model.
-func parseClaudeUsageWindows(body []byte) (*coreauth.ScopedWindow, []coreauth.ScopedWindow, error) {
+func parseClaudeUsageWindows(body []byte, observedAt time.Time) (*coreauth.ScopedWindow, []coreauth.ScopedWindow, error) {
 	var payload struct {
 		Limits []struct {
 			Kind     string   `json:"kind"`
@@ -245,7 +245,7 @@ func parseClaudeUsageWindows(body []byte) (*coreauth.ScopedWindow, []coreauth.Sc
 		if err != nil {
 			continue
 		}
-		window := coreauth.ScopedWindow{Utilization: *limit.Percent / 100, ResetsAt: resetsAt}
+		window := coreauth.ScopedWindow{Utilization: *limit.Percent / 100, ResetsAt: resetsAt, ObservedAt: observedAt}
 		switch limit.Kind {
 		case "weekly_all":
 			account = &window

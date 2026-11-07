@@ -12,7 +12,7 @@ import (
 var soonestResetNow = time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
 
 func soonestResetAuth(id string, used string, resetIn time.Duration) *Auth {
-	auth := &Auth{ID: id}
+	auth := &Auth{ID: id, Provider: "claude"}
 	if used != "" {
 		auth.Quota.Signals = map[string]string{
 			claudeSevenDayUtilizationSignal: used,
@@ -169,7 +169,7 @@ func TestParseUtilizationAcceptsFractionAndPercent(t *testing.T) {
 // After a restart no account has header signals. The usage endpoint's
 // account-wide window still ranks them, so routing does not fall back to ID order.
 func TestSoonestResetSelectorUsesPolledAccountWindowWithoutHeaders(t *testing.T) {
-	early, late := &Auth{ID: "a-late"}, &Auth{ID: "b-early"}
+	early, late := &Auth{ID: "a-late", Provider: "claude"}, &Auth{ID: "b-early", Provider: "claude"}
 	SetClaudeUsageWindows(early.ID, &ScopedWindow{Utilization: 0.1, ResetsAt: soonestResetNow.Add(5 * 24 * time.Hour)}, nil)
 	SetClaudeUsageWindows(late.ID, &ScopedWindow{Utilization: 0.6, ResetsAt: soonestResetNow.Add(1 * 24 * time.Hour)}, nil)
 	t.Cleanup(func() { ClearClaudeScopedWindows(early.ID); ClearClaudeScopedWindows(late.ID) })
@@ -216,5 +216,61 @@ func TestRetainClaudeScopedWindowsForgetsRemovedAccounts(t *testing.T) {
 	}
 	if _, ok := claudeScopedWindowFor("kept", "claude-fable-5-1"); !ok {
 		t.Fatalf("kept account's window was dropped")
+	}
+}
+
+// A Claude API-key credential never receives the seven-day headers and is not
+// polled, so it must not take every new session ahead of accounts with data.
+func TestSoonestResetSelectorDoesNotPreferAPIKeyWithoutData(t *testing.T) {
+	t.Parallel()
+	apiKey := &Auth{ID: "a-api-key", Provider: "claude", Attributes: map[string]string{"api_key": "fixture"}}
+	got := pickSoonest(t, &SoonestResetSelector{}, "claude-opus-5-5",
+		apiKey,
+		soonestResetAuth("b-oauth", "0.30", 2*24*time.Hour),
+	)
+	if got != "b-oauth" {
+		t.Fatalf("picked %q, want b-oauth ahead of an API key that cannot supply data", got)
+	}
+}
+
+// An account tried for its data keeps the front for the probe window only. If
+// no data arrives, accounts with data go first again.
+func TestSoonestResetSelectorProbeWindowExpires(t *testing.T) {
+	t.Parallel()
+	selector := &SoonestResetSelector{}
+	unknown := soonestResetAuth("z-unknown", "", 0)
+	known := soonestResetAuth("b-known", "0.30", 2*24*time.Hour)
+	start := soonestResetNow
+	pickAt := func(at time.Time) string {
+		selector.now = func() time.Time { return at }
+		got, err := selector.Pick(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, []*Auth{known, unknown})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.ID
+	}
+	if got := pickAt(start); got != "z-unknown" {
+		t.Fatalf("first pick %q, want z-unknown", got)
+	}
+	if got := pickAt(start.Add(9 * time.Minute)); got != "z-unknown" {
+		t.Fatalf("pick inside the probe window %q, want z-unknown", got)
+	}
+	if got := pickAt(start.Add(11 * time.Minute)); got != "b-known" {
+		t.Fatalf("pick after the probe window %q, want b-known", got)
+	}
+}
+
+// When both sources hold the seven-day window, the newer one decides.
+func TestSoonestResetSelectorUsesNewerOfHeaderAndPolledWindow(t *testing.T) {
+	stale := soonestResetAuth("a-stale-header", "0.40", 1*24*time.Hour)
+	stale.Quota.ObservedAt = soonestResetNow.Add(-72 * time.Hour)
+	other := soonestResetAuth("b-other", "0.50", 3*24*time.Hour)
+	other.Quota.ObservedAt = soonestResetNow.Add(-time.Minute)
+	SetClaudeUsageWindows(stale.ID, &ScopedWindow{Utilization: 0.93, ResetsAt: soonestResetNow.Add(24 * time.Hour), ObservedAt: soonestResetNow.Add(-10 * time.Minute)}, nil)
+	SetClaudeUsageWindows(other.ID, &ScopedWindow{Utilization: 0.99, ResetsAt: soonestResetNow.Add(3 * 24 * time.Hour), ObservedAt: soonestResetNow.Add(-2 * time.Hour)}, nil)
+	t.Cleanup(func() { ClearClaudeScopedWindows(stale.ID); ClearClaudeScopedWindows(other.ID) })
+
+	if got := pickSoonest(t, &SoonestResetSelector{}, "claude-opus-5-5", stale, other); got != "b-other" {
+		t.Fatalf("picked %q, want b-other: a-stale-header's newer poll says 93%% and b-other's newer header says 50%%", got)
 	}
 }

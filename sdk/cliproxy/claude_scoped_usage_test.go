@@ -19,7 +19,7 @@ func TestParseClaudeUsageWindowsReadsAccountAndModelLimits(t *testing.T) {
 		{"kind":"weekly_scoped","group":"weekly","percent":42,"severity":"normal","resets_at":"2026-11-09T20:00:00.453711+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false},
 		{"kind":"weekly_scoped","percent":null,"resets_at":"2026-11-09T20:00:00Z","scope":{"model":{"display_name":"Other"}}}
 	]}`)
-	account, windows, err := parseClaudeUsageWindows(body)
+	account, windows, err := parseClaudeUsageWindows(body, time.Now())
 	if err != nil {
 		t.Fatalf("parseClaudeUsageWindows() error = %v", err)
 	}

@@ -16,6 +16,11 @@ import (
 // receiving new sessions under the soonest-reset strategy.
 const DefaultSoonestResetThreshold = 0.9
 
+// soonestResetProbeWindow is how long an account without data keeps its place at
+// the front after it was first tried. A response normally supplies the data well
+// within it; one that does not drops behind the accounts with data.
+const soonestResetProbeWindow = 10 * time.Minute
+
 const (
 	claudeSevenDayUtilizationSignal = "Anthropic-Ratelimit-Unified-7d-Utilization"
 	claudeSevenDayResetSignal       = "Anthropic-Ratelimit-Unified-7d-Reset"
@@ -30,6 +35,8 @@ type ScopedWindow struct {
 	Utilization float64
 	// ResetsAt is when the window resets.
 	ResetsAt time.Time
+	// ObservedAt is when the window was read.
+	ObservedAt time.Time
 }
 
 type claudeUsageWindows struct {
@@ -123,6 +130,9 @@ type SoonestResetSelector struct {
 	now func() time.Time
 
 	roundRobin RoundRobinSelector
+
+	mu     sync.Mutex
+	probed map[string]time.Time
 }
 
 func (s *SoonestResetSelector) threshold() float64 {
@@ -148,18 +158,32 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	if picked := pickSoonestReset(available, model, s.threshold(), now); picked != nil {
-		return picked, nil
+	s.mu.Lock()
+	if s.probed == nil {
+		s.probed = make(map[string]time.Time)
 	}
-	return s.roundRobin.Pick(ctx, provider, model, opts, available)
+	picked, learning := pickSoonestReset(available, model, s.threshold(), now, s.probed)
+	if picked != nil && learning {
+		if _, ok := s.probed[picked.ID]; !ok {
+			s.probed[picked.ID] = now
+		}
+	}
+	s.mu.Unlock()
+	if picked == nil {
+		return s.roundRobin.Pick(ctx, provider, model, opts, available)
+	}
+	return picked, nil
 }
 
 type resetCandidate struct {
 	auth  *Auth
 	order int
 	known bool
-	used  float64
-	reset time.Time
+	// learns marks an account without data that goes first, because its next
+	// response is expected to supply the data.
+	learns bool
+	used   float64
+	reset  time.Time
 	// modelUsed is the requested model's weekly utilization, or -1 when unknown.
 	modelUsed float64
 }
@@ -185,16 +209,26 @@ func (c resetCandidate) remainingPerHour(now time.Time) float64 {
 	return (1 - c.used) / hours
 }
 
-func pickSoonestReset(available []*Auth, model string, threshold float64, now time.Time) *Auth {
+// pickSoonestReset returns the chosen account and whether it was chosen to learn
+// its window, or nil when no candidate has any window data. probed holds when
+// each account without data was first tried; entries of accounts with data are
+// removed, so an account whose window resets can be tried again.
+func pickSoonestReset(available []*Auth, model string, threshold float64, now time.Time, probed map[string]time.Time) (*Auth, bool) {
 	candidates := make([]resetCandidate, 0, len(available))
 	anyKnown := false
 	for i, auth := range available {
 		candidate := resetCandidateFor(auth, i, model, now)
+		if candidate.known {
+			delete(probed, auth.ID)
+		} else if claudeAccountLearnsFromResponses(auth) {
+			first, tried := probed[auth.ID]
+			candidate.learns = !tried || now.Sub(first) < soonestResetProbeWindow
+		}
 		anyKnown = anyKnown || candidate.known || candidate.modelUsed >= 0
 		candidates = append(candidates, candidate)
 	}
 	if !anyKnown {
-		return nil
+		return nil, false
 	}
 	eligible := make([]resetCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -212,14 +246,15 @@ func pickSoonestReset(available []*Auth, model string, threshold float64, now ti
 			}
 			return candidates[i].order < candidates[j].order
 		})
-		return candidates[0].auth
+		return candidates[0].auth, false
 	}
 	sort.SliceStable(eligible, func(i, j int) bool {
 		left, right := eligible[i], eligible[j]
-		// An account without data goes first: one response teaches its window,
-		// whereas ranking it last would leave it unused until a poll succeeds.
-		if left.known != right.known {
-			return !left.known
+		// An account without data that can learn from a response goes first: one
+		// response teaches its window, whereas ranking it last would leave it unused
+		// until a poll succeeds. Other accounts without data go last.
+		if left.rank() != right.rank() {
+			return left.rank() < right.rank()
 		}
 		if !left.known {
 			return left.order < right.order
@@ -233,7 +268,29 @@ func pickSoonestReset(available []*Auth, model string, threshold float64, now ti
 		}
 		return left.order < right.order
 	})
-	return eligible[0].auth
+	return eligible[0].auth, eligible[0].learns
+}
+
+// rank orders eligible candidates: learning accounts, then accounts with data,
+// then accounts without data that cannot learn.
+func (c resetCandidate) rank() int {
+	switch {
+	case c.learns:
+		return 0
+	case c.known:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// claudeAccountLearnsFromResponses reports whether an account's responses carry
+// the seven-day headers: a Claude OAuth account. API-key credentials do not.
+func claudeAccountLearnsFromResponses(auth *Auth) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+		return false
+	}
+	return auth.Attributes == nil || strings.TrimSpace(auth.Attributes["api_key"]) == ""
 }
 
 func resetCandidateFor(auth *Auth, order int, model string, now time.Time) resetCandidate {
@@ -243,19 +300,23 @@ func resetCandidateFor(auth *Auth, order int, model string, now time.Time) reset
 	}
 	// A window whose reset time has passed has started over, so its old
 	// utilization no longer applies and the account ranks with unknown data.
-	// Response headers are the fresher source. The usage endpoint's account-wide
-	// window covers accounts that have served no request since the process started,
-	// because the header snapshot is held in memory only.
+	// Two sources give the seven-day window: response headers and the usage
+	// endpoint's account-wide window. The newer one wins. The header snapshot is
+	// held in memory only, so after a restart the polled window is all there is.
 	used, okUsed := parseUtilization(auth.Quota.Signals[claudeSevenDayUtilizationSignal])
 	reset, okReset := parseUnixSeconds(auth.Quota.Signals[claudeSevenDayResetSignal])
-	if okUsed && okReset && reset.After(now) {
-		candidate.known = true
-		candidate.used = used
-		candidate.reset = reset
-	} else if window, ok := claudeAccountWindowFor(auth.ID); ok && window.ResetsAt.After(now) {
+	headerValid := okUsed && okReset && reset.After(now)
+	window, okWindow := claudeAccountWindowFor(auth.ID)
+	windowValid := okWindow && window.ResetsAt.After(now)
+	switch {
+	case windowValid && (!headerValid || window.ObservedAt.After(auth.Quota.ObservedAt)):
 		candidate.known = true
 		candidate.used = window.Utilization
 		candidate.reset = window.ResetsAt
+	case headerValid:
+		candidate.known = true
+		candidate.used = used
+		candidate.reset = reset
 	}
 	if window, ok := claudeScopedWindowFor(auth.ID, model); ok && window.ResetsAt.After(now) {
 		candidate.modelUsed = window.Utilization
