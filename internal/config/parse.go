@@ -65,13 +65,16 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		cfg.Discovery.Subtypes = []string{"_chat-completions", "_responses", "_messages", "_generate-content", "_interactions"}
 	}
 
-	// Hash remote management key if plaintext is detected (nested), but do NOT persist.
-	if cfg.RemoteManagement.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.SecretKey) {
-		hashed, errHash := bcrypt.GenerateFromPassword([]byte(cfg.RemoteManagement.SecretKey), bcrypt.DefaultCost)
-		if errHash != nil {
-			return nil, fmt.Errorf("hash remote management key: %w", errHash)
+	// Hash the management keys if plaintext is detected (nested), but do NOT persist.
+	for _, key := range managementKeys(&cfg) {
+		if *key.value == "" || looksLikeBcrypt(*key.value) {
+			continue
 		}
-		cfg.RemoteManagement.SecretKey = string(hashed)
+		hashed, errHash := bcrypt.GenerateFromPassword([]byte(*key.value), bcrypt.DefaultCost)
+		if errHash != nil {
+			return nil, fmt.Errorf("hash %s: %w", key.description, errHash)
+		}
+		*key.value = string(hashed)
 	}
 
 	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)

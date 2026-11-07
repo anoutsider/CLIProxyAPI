@@ -517,6 +517,16 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			changes = append(changes, "remote-management.secret-key: updated")
 		}
 	}
+	if oldCfg.RemoteManagement.UsageReadKey != newCfg.RemoteManagement.UsageReadKey {
+		switch {
+		case oldCfg.RemoteManagement.UsageReadKey == "" && newCfg.RemoteManagement.UsageReadKey != "":
+			changes = append(changes, "remote-management.usage-read-key: created")
+		case oldCfg.RemoteManagement.UsageReadKey != "" && newCfg.RemoteManagement.UsageReadKey == "":
+			changes = append(changes, "remote-management.usage-read-key: deleted")
+		default:
+			changes = append(changes, "remote-management.usage-read-key: updated")
+		}
+	}
 
 	// OpenAI compatibility providers (summarized)
 	if compat := DiffOpenAICompatibility(oldCfg.OpenAICompatibility, newCfg.OpenAICompatibility); len(compat) > 0 {
