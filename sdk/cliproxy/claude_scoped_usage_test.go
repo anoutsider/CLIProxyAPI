@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -11,24 +12,63 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-func TestParseClaudeScopedWindowsReadsWeeklyScopedLimits(t *testing.T) {
-	body := []byte(`{"five_hour":null,"seven_day":{"utilization":71,"resets_at":"2026-11-09T19:59:59Z"},
-		"limits":[
-			{"kind":"weekly_scoped","percent":42,"resets_at":"2026-11-09T20:00:00+00:00","scope":{"model":{"display_name":"Fable"}}},
-			{"kind":"weekly","percent":71,"resets_at":"2026-11-09T20:00:00Z"},
-			{"kind":"weekly_scoped","percent":null,"resets_at":"2026-11-09T20:00:00Z","scope":{"model":{"display_name":"Other"}}}
-		]}`)
-	windows, err := parseClaudeScopedWindows(body)
+// The limits shape the usage endpoint returned on 2026-11-07.
+func TestParseClaudeUsageWindowsReadsAccountAndModelLimits(t *testing.T) {
+	body := []byte(`{"five_hour":null,"limits":[
+		{"kind":"weekly_all","group":"weekly","percent":71,"severity":"normal","resets_at":"2026-11-09T19:59:59.453524+00:00","scope":null,"is_active":true},
+		{"kind":"weekly_scoped","group":"weekly","percent":42,"severity":"normal","resets_at":"2026-11-09T20:00:00.453711+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false},
+		{"kind":"weekly_scoped","percent":null,"resets_at":"2026-11-09T20:00:00Z","scope":{"model":{"display_name":"Other"}}}
+	]}`)
+	account, windows, err := parseClaudeUsageWindows(body)
 	if err != nil {
-		t.Fatalf("parseClaudeScopedWindows() error = %v", err)
+		t.Fatalf("parseClaudeUsageWindows() error = %v", err)
 	}
-	if len(windows) != 1 {
-		t.Fatalf("windows = %+v, want only the Fable weekly_scoped limit", windows)
+	if account == nil || account.Utilization != 0.71 || account.ResetsAt.Format(time.RFC3339) != "2026-11-09T19:59:59Z" {
+		t.Fatalf("account window = %+v, want 0.71 resetting 2026-11-09T19:59:59Z", account)
 	}
-	got := windows[0]
-	want := time.Date(2026, 11, 9, 20, 0, 0, 0, time.UTC)
-	if got.Name != "Fable" || got.Utilization != 0.42 || !got.ResetsAt.Equal(want) {
-		t.Fatalf("window = %+v, want Fable at 0.42 resetting %s", got, want)
+	if len(windows) != 1 || windows[0].Name != "Fable" || windows[0].Utilization != 0.42 {
+		t.Fatalf("model windows = %+v, want only Fable at 0.42", windows)
+	}
+}
+
+func TestFetchClaudeUsageSendsOAuthRequest(t *testing.T) {
+	var gotAuth, gotBeta string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, gotBeta = r.Header.Get("Authorization"), r.Header.Get("Anthropic-Beta")
+		_, _ = w.Write([]byte(`{"limits":[{"kind":"weekly_all","percent":5,"resets_at":"2026-11-09T20:00:00Z","scope":null}]}`))
+	}))
+	defer server.Close()
+	previous := claudeUsageURL
+	claudeUsageURL = server.URL
+	t.Cleanup(func() { claudeUsageURL = previous })
+
+	auth := &coreauth.Auth{ID: "a", Provider: "claude", Metadata: map[string]any{"access_token": "fixture-token"}}
+	result, err := fetchClaudeUsage(context.Background(), &config.Config{}, auth)
+	if err != nil || result.status != http.StatusOK {
+		t.Fatalf("fetchClaudeUsage() = %+v, %v", result, err)
+	}
+	if gotAuth != "Bearer fixture-token" || gotBeta != "oauth-2025-04-20" {
+		t.Fatalf("request headers Authorization=%q Anthropic-Beta=%q", gotAuth, gotBeta)
+	}
+	if result.account == nil || result.account.Utilization != 0.05 {
+		t.Fatalf("account window = %+v, want 0.05", result.account)
+	}
+}
+
+func TestFetchClaudeUsageReportsRetryAfterOnRateLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "600")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	previous := claudeUsageURL
+	claudeUsageURL = server.URL
+	t.Cleanup(func() { claudeUsageURL = previous })
+
+	auth := &coreauth.Auth{ID: "a", Provider: "claude", Metadata: map[string]any{"access_token": "fixture-token"}}
+	result, err := fetchClaudeUsage(context.Background(), &config.Config{}, auth)
+	if err == nil || result.status != http.StatusTooManyRequests || result.retryAfter != 10*time.Minute {
+		t.Fatalf("fetchClaudeUsage() = %+v, %v; want 429 with a 10 minute Retry-After", result, err)
 	}
 }
 
@@ -80,8 +120,9 @@ func TestClaudeScopedUsagePollerRunsOnlyUnderSoonestReset(t *testing.T) {
 }
 
 func TestClaudeUsageEligibleNeedsAnActiveClaudeOAuthAccount(t *testing.T) {
-	oauth := &coreauth.Auth{ID: "a", Provider: "claude", Metadata: map[string]any{"access_token": "fixture"}}
-	if !claudeUsageEligible(oauth) {
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	oauth := &coreauth.Auth{ID: "a", Provider: "claude", Metadata: map[string]any{"access_token": "fixture", "expired": "2026-11-07T15:00:00Z"}}
+	if !claudeUsageEligible(oauth, now) {
 		t.Fatalf("an active Claude OAuth account should be polled")
 	}
 	for name, auth := range map[string]*coreauth.Auth{
@@ -89,8 +130,9 @@ func TestClaudeUsageEligibleNeedsAnActiveClaudeOAuthAccount(t *testing.T) {
 		"codex":    {ID: "c", Provider: "codex", Metadata: map[string]any{"access_token": "fixture"}},
 		"api key":  {ID: "d", Provider: "claude", Attributes: map[string]string{"api_key": "fixture"}, Metadata: map[string]any{"access_token": "fixture"}},
 		"no token": {ID: "e", Provider: "claude"},
+		"expired":  {ID: "f", Provider: "claude", Metadata: map[string]any{"access_token": "fixture", "expired": "2026-11-07T11:00:00Z"}},
 	} {
-		if claudeUsageEligible(auth) {
+		if claudeUsageEligible(auth, now) {
 			t.Fatalf("%s account should not be polled", name)
 		}
 	}
@@ -112,5 +154,19 @@ func TestNewRoutingSelectorBuildsSoonestReset(t *testing.T) {
 	selector, ok := newRoutingSelector(state).(*coreauth.SoonestResetSelector)
 	if !ok || selector.Threshold != 0.8 {
 		t.Fatalf("selector = %#v, want SoonestResetSelector at 0.8", newRoutingSelector(state))
+	}
+}
+
+func TestClaudeScopedUsagePollerRetainForgetsRemovedAccounts(t *testing.T) {
+	p := newClaudeScopedUsagePoller(nil)
+	now := time.Now()
+	p.record("gone", claudeUsageResult{status: http.StatusTooManyRequests}, errors.New("429"), now)
+	p.record("kept", claudeUsageResult{status: http.StatusTooManyRequests}, errors.New("429"), now)
+	p.retain([]*coreauth.Auth{{ID: "kept"}})
+	if _, ok := p.next["gone"]; ok {
+		t.Fatalf("poll state of a removed account was kept")
+	}
+	if _, ok := p.backoff["kept"]; !ok {
+		t.Fatalf("poll state of a kept account was dropped")
 	}
 }

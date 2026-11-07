@@ -18,8 +18,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// claudeUsageURL is replaced in tests.
+var claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
+
 const (
-	claudeUsageURL                = "https://api.anthropic.com/api/oauth/usage"
 	claudeScopedUsageInterval     = 15 * time.Minute
 	claudeScopedUsageMinBackoff   = 30 * time.Minute
 	claudeScopedUsageMaxBackoff   = 2 * time.Hour
@@ -44,6 +46,7 @@ type claudeScopedUsagePoller struct {
 type claudeUsageResult struct {
 	status     int
 	retryAfter time.Duration
+	account    *coreauth.ScopedWindow
 	windows    []coreauth.ScopedWindow
 }
 
@@ -87,11 +90,13 @@ func (p *claudeScopedUsagePoller) tick(ctx context.Context, now time.Time) {
 	if p.service == nil || p.service.coreManager == nil {
 		return
 	}
-	for _, auth := range p.service.coreManager.List() {
+	auths := p.service.coreManager.List()
+	p.retain(auths)
+	for _, auth := range auths {
 		if ctx.Err() != nil {
 			return
 		}
-		if !claudeUsageEligible(auth) || !p.due(auth.ID, now) {
+		if !claudeUsageEligible(auth, now) || !p.due(auth.ID, now) {
 			continue
 		}
 		result, err := p.fetch(ctx, cfg, auth)
@@ -99,14 +104,42 @@ func (p *claudeScopedUsagePoller) tick(ctx context.Context, now time.Time) {
 	}
 }
 
-func claudeUsageEligible(auth *coreauth.Auth) bool {
+// retain forgets poll state and usage windows for accounts the manager no longer holds.
+func (p *claudeScopedUsagePoller) retain(auths []*coreauth.Auth) {
+	keep := make(map[string]struct{}, len(auths))
+	for _, auth := range auths {
+		if auth != nil {
+			keep[auth.ID] = struct{}{}
+		}
+	}
+	coreauth.RetainClaudeScopedWindows(keep)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for authID := range p.next {
+		if _, ok := keep[authID]; !ok {
+			delete(p.next, authID)
+			delete(p.backoff, authID)
+		}
+	}
+}
+
+// claudeUsageEligible reports whether an account can be polled now: an enabled
+// Claude OAuth account whose access token has not expired. The refresh loop
+// renews an expired token, and the next tick polls it.
+func claudeUsageEligible(auth *coreauth.Auth, now time.Time) bool {
 	if auth == nil || auth.Disabled || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
 		return false
 	}
 	if auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != "" {
 		return false
 	}
-	return claudeauth.ReadMetadataString(&auth.Metadata, "access_token") != ""
+	if claudeauth.ReadMetadataString(&auth.Metadata, "access_token") == "" {
+		return false
+	}
+	if expired, err := time.Parse(time.RFC3339, claudeauth.ReadMetadataString(&auth.Metadata, "expired")); err == nil && !now.Before(expired) {
+		return false
+	}
+	return true
 }
 
 func (p *claudeScopedUsagePoller) due(authID string, now time.Time) bool {
@@ -121,7 +154,7 @@ func (p *claudeScopedUsagePoller) record(authID string, result claudeUsageResult
 	defer p.mu.Unlock()
 	switch {
 	case err == nil && result.status == http.StatusOK:
-		coreauth.SetClaudeScopedWindows(authID, result.windows)
+		coreauth.SetClaudeUsageWindows(authID, result.account, result.windows)
 		log.Debugf("claude scoped usage: account %s has %d per-model windows", authID, len(result.windows))
 		delete(p.backoff, authID)
 		p.next[authID] = now.Add(claudeScopedUsageInterval)
@@ -172,7 +205,7 @@ func fetchClaudeUsage(ctx context.Context, cfg *config.Config, auth *coreauth.Au
 	if err != nil {
 		return result, err
 	}
-	result.windows, err = parseClaudeScopedWindows(body)
+	result.account, result.windows, err = parseClaudeUsageWindows(body)
 	return result, err
 }
 
@@ -184,15 +217,15 @@ func parseRetryAfterSeconds(value string) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// parseClaudeScopedWindows reads the "weekly_scoped" limits of a usage response,
-// one per model with its own weekly window.
-func parseClaudeScopedWindows(body []byte) ([]coreauth.ScopedWindow, error) {
+// parseClaudeUsageWindows reads the limits of a usage response: the account-wide
+// "weekly_all" window and one "weekly_scoped" window per model.
+func parseClaudeUsageWindows(body []byte) (*coreauth.ScopedWindow, []coreauth.ScopedWindow, error) {
 	var payload struct {
 		Limits []struct {
 			Kind     string   `json:"kind"`
 			Percent  *float64 `json:"percent"`
 			ResetsAt *string  `json:"resets_at"`
-			Scope    struct {
+			Scope    *struct {
 				Model struct {
 					DisplayName string `json:"display_name"`
 				} `json:"model"`
@@ -200,19 +233,29 @@ func parseClaudeScopedWindows(body []byte) ([]coreauth.ScopedWindow, error) {
 		} `json:"limits"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	var account *coreauth.ScopedWindow
 	windows := make([]coreauth.ScopedWindow, 0, len(payload.Limits))
 	for _, limit := range payload.Limits {
-		name := strings.TrimSpace(limit.Scope.Model.DisplayName)
-		if limit.Kind != "weekly_scoped" || name == "" || limit.Percent == nil || limit.ResetsAt == nil {
+		if limit.Percent == nil || limit.ResetsAt == nil {
 			continue
 		}
 		resetsAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*limit.ResetsAt))
 		if err != nil {
 			continue
 		}
-		windows = append(windows, coreauth.ScopedWindow{Name: name, Utilization: *limit.Percent / 100, ResetsAt: resetsAt})
+		window := coreauth.ScopedWindow{Utilization: *limit.Percent / 100, ResetsAt: resetsAt}
+		switch limit.Kind {
+		case "weekly_all":
+			account = &window
+		case "weekly_scoped":
+			if limit.Scope == nil || strings.TrimSpace(limit.Scope.Model.DisplayName) == "" {
+				continue
+			}
+			window.Name = strings.TrimSpace(limit.Scope.Model.DisplayName)
+			windows = append(windows, window)
+		}
 	}
-	return windows, nil
+	return account, windows, nil
 }
