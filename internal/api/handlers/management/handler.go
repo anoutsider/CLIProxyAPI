@@ -469,6 +469,11 @@ func (h *Handler) authenticateManagementKey(clientIP string, localClient bool, p
 	}
 
 	if secretHash != "" && bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) == nil {
+		// A usage read key equal to the full key would hand full access to whoever
+		// holds the read key, so neither is accepted until they differ.
+		if usageReadHash != "" && bcrypt.CompareHashAndPassword([]byte(usageReadHash), []byte(provided)) == nil {
+			return managementKeyNone, http.StatusForbidden, "usage-read-key must differ from secret-key"
+		}
 		reset()
 		return managementKeyFull, 0, ""
 	}

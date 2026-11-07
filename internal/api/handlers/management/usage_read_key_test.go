@@ -77,6 +77,9 @@ func TestUsageReadKeyRestrictsManagementRequests(t *testing.T) {
 		{"post to usage url", usageKey, http.MethodPost, "/v0/management/api-call", apiCall("claude", "POST", anthropicUsage, ""), http.StatusForbidden},
 		{"request proxy", usageKey, http.MethodPost, "/v0/management/api-call", apiCall("claude", "GET", anthropicUsage, `,"proxy_url":"http://127.0.0.1:9"`), http.StatusForbidden},
 		{"host override", usageKey, http.MethodPost, "/v0/management/api-call", `{"auth_index":"` + auths["claude"].Index + `","method":"GET","url":"` + anthropicUsage + `","header":{"Host":"example.com"}}`, http.StatusForbidden},
+		{"token in another header", usageKey, http.MethodPost, "/v0/management/api-call", apiCall("claude", "GET", anthropicUsage, "")[:len(apiCall("claude", "GET", anthropicUsage, ""))-2] + `,"Origin":"$TOKEN$"}}`, http.StatusForbidden},
+		{"token in body", usageKey, http.MethodPost, "/v0/management/api-call", apiCall("claude", "GET", anthropicUsage, `,"data":"$TOKEN$"`), http.StatusForbidden},
+		{"token in another authorization form", usageKey, http.MethodPost, "/v0/management/api-call", `{"auth_index":"` + auths["claude"].Index + `","method":"GET","url":"` + anthropicUsage + `","header":{"Authorization":"Basic $TOKEN$"}}`, http.StatusForbidden},
 		{"credential of another provider", usageKey, http.MethodPost, "/v0/management/api-call", apiCall("codex", "GET", anthropicUsage, ""), http.StatusForbidden},
 		{"auth file download", usageKey, http.MethodGet, "/v0/management/auth-files/download?name=claude-1", "", http.StatusForbidden},
 		{"other route", usageKey, http.MethodGet, "/v0/management/config", "", http.StatusForbidden},
@@ -133,5 +136,70 @@ func TestUsageReadKeyRestrictsManagementRequests(t *testing.T) {
 
 	if allowed, statusCode, _ := h.AuthenticateManagementKey("127.0.0.1", true, usageKey); allowed || statusCode != http.StatusForbidden {
 		t.Fatalf("AuthenticateManagementKey(usage key) = %v, %d; want refused with 403", allowed, statusCode)
+	}
+}
+
+// APICall itself, for the usage read key: a redirect is not followed and a token the
+// upstream echoes back is removed from the reply.
+func TestAPICallUsageReadKeyScrubsTokenAndRefusesRedirect(t *testing.T) {
+	const token = "fixture-access-token"
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("redirect was followed to %s", r.URL)
+	}))
+	defer redirectTarget.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect" {
+			http.Redirect(w, r, redirectTarget.URL, http.StatusTemporaryRedirect)
+			return
+		}
+		w.Header().Set("X-Echo", r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte("seen " + r.Header.Get("Authorization")))
+	}))
+	defer upstream.Close()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "claude-1", Provider: "claude", Attributes: map[string]string{"runtime_only": "true"}, Metadata: map[string]any{"access_token": token}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	auth.EnsureIndex()
+	h := &Handler{cfg: &config.Config{}, authManager: manager, failedAttempts: make(map[string]*attemptInfo)}
+
+	call := func(path string, usageRead bool) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		body := `{"auth_index":"` + auth.Index + `","method":"GET","url":"` + upstream.URL + path + `","header":{"Authorization":"Bearer $TOKEN$"}}`
+		c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(body))
+		c.Request.Header.Set("Content-Type", "application/json")
+		if usageRead {
+			c.Set(usageReadKeyContextKey, true)
+		}
+		h.APICall(c)
+		return rec
+	}
+
+	if rec := call("/echo", true); strings.Contains(rec.Body.String(), token) || rec.Code != http.StatusOK {
+		t.Fatalf("usage read key reply = %d %s, want 200 without the token", rec.Code, rec.Body.String())
+	}
+	if rec := call("/echo", false); !strings.Contains(rec.Body.String(), token) {
+		t.Fatalf("full key reply should be unchanged, got %s", rec.Body.String())
+	}
+	if rec := call("/redirect", true); !strings.Contains(rec.Body.String(), `"status_code":307`) {
+		t.Fatalf("usage read key should return the redirect itself, got %s", rec.Body.String())
+	}
+}
+
+func TestUsageReadKeyEqualToSecretKeyIsRefused(t *testing.T) {
+	hashed, errHash := bcrypt.GenerateFromPassword([]byte("same-key"), bcrypt.MinCost)
+	if errHash != nil {
+		t.Fatal(errHash)
+	}
+	cfg := &config.Config{}
+	cfg.RemoteManagement.SecretKey = string(hashed)
+	cfg.RemoteManagement.UsageReadKey = string(hashed)
+	h := &Handler{cfg: cfg, failedAttempts: make(map[string]*attemptInfo)}
+	scope, status, _ := h.authenticateManagementKey("127.0.0.1", true, "same-key")
+	if scope != managementKeyNone || status != http.StatusForbidden {
+		t.Fatalf("scope=%v status=%d, want refusal while the keys collide", scope, status)
 	}
 }

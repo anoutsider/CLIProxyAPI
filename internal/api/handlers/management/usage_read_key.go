@@ -72,11 +72,22 @@ func (h *Handler) usageReadAPICallAllowed(c *gin.Context) bool {
 	if errBind := binding.JSON.BindBody(raw, &body); errBind != nil {
 		return false
 	}
-	if strings.ToUpper(strings.TrimSpace(body.Method)) != http.MethodGet || strings.TrimSpace(body.ProxyURL) != "" {
+	if strings.ToUpper(strings.TrimSpace(body.Method)) != http.MethodGet || strings.TrimSpace(body.ProxyURL) != "" || body.Data != "" {
 		return false
 	}
-	for key := range body.Header {
+	// The token may only travel as the Authorization bearer: any other header could
+	// be echoed back by the upstream or survive a cross-host redirect.
+	for key, value := range body.Header {
 		if strings.EqualFold(key, "host") {
+			return false
+		}
+		if strings.EqualFold(key, "authorization") {
+			if value != "Bearer $TOKEN$" {
+				return false
+			}
+			continue
+		}
+		if strings.Contains(value, "$TOKEN$") {
 			return false
 		}
 	}
@@ -115,4 +126,12 @@ func usageReadAuthFileEntry(c *gin.Context, entry gin.H) gin.H {
 		}
 	}
 	return reduced
+}
+
+// scrubToken removes token from text returned to the usage read key.
+func scrubToken(text, token string) string {
+	if token == "" {
+		return text
+	}
+	return strings.ReplaceAll(text, token, "[redacted]")
 }

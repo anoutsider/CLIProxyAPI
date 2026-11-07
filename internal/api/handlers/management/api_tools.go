@@ -214,6 +214,11 @@ func (h *Handler) APICall(c *gin.Context) {
 		Timeout: defaultAPICallTimeout,
 	}
 	httpClient.Transport = h.apiCallTransport(auth, requestProxyURL)
+	usageReadKey := c.GetBool(usageReadKeyContextKey)
+	if usageReadKey {
+		// A redirect could carry the request to another host; the usage URLs need none.
+		httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
 
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
@@ -233,10 +238,20 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	responseHeader, responseBody := resp.Header, string(respBody)
+	if usageReadKey {
+		responseHeader = make(http.Header, len(resp.Header))
+		for key, values := range resp.Header {
+			for _, value := range values {
+				responseHeader.Add(key, scrubToken(value, token))
+			}
+		}
+		responseBody = scrubToken(responseBody, token)
+	}
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
-		Header:     resp.Header,
-		Body:       string(respBody),
+		Header:     responseHeader,
+		Body:       responseBody,
 	})
 }
 
