@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,12 +131,12 @@ func TestPoolAlertKeysStayTheSameWithinADay(t *testing.T) {
 		}
 	}
 	morning := time.Date(2026, 11, 8, 6, 0, 0, 0, time.UTC)
-	first, ok := poolRunsOutAlert(summary(morning, time.Date(2026, 11, 9, 6, 0, 0, 0, time.UTC)), morning)
+	first, ok := poolRunsOutAlert(summary(morning, time.Date(2026, 11, 9, 6, 0, 0, 0, time.UTC)), nil, morning)
 	if !ok {
 		t.Fatal("no runs-out alert")
 	}
 	later := morning.Add(5 * time.Hour)
-	second, ok := poolRunsOutAlert(summary(later, time.Date(2026, 11, 9, 20, 0, 0, 0, time.UTC)), later)
+	second, ok := poolRunsOutAlert(summary(later, time.Date(2026, 11, 9, 20, 0, 0, 0, time.UTC)), nil, later)
 	if !ok || second.Key != first.Key || first.Key != "runs-out:2026-11-09" {
 		t.Fatalf("runs-out keys = %q, %q; want both runs-out:2026-11-09", first.Key, second.Key)
 	}
@@ -184,5 +185,37 @@ func TestPoolHistoryRoundTripsThroughKVStore(t *testing.T) {
 	ttl, ok, errTTL := store.KVTTL(ctx, poolHistoryKey(second.At))
 	if errTTL != nil || !ok || ttl <= PoolHistoryRetention-24*time.Hour || ttl > PoolHistoryRetention+24*time.Hour {
 		t.Fatalf("day key ttl = %v (ok %v, err %v), want about %v", ttl, ok, errTTL, PoolHistoryRetention)
+	}
+}
+
+func TestPoolRunsOutAlertFiresWhenAResetComesFirst(t *testing.T) {
+	// a resets first, but its restored quota fills again before b's reset ends
+	// the gap, so the typical day runs out after a's reset.
+	slots := []poolSlot{
+		{used: 0.5, reset: poolNow.Add(6 * time.Hour)},
+		{used: 0.95, reset: poolNow.Add(50 * time.Hour)},
+		{used: 0.95, reset: poolNow.Add(60 * time.Hour)},
+	}
+	resets := []PoolNextReset{
+		{Email: "a@example.com", At: slots[0].reset},
+		{Email: "b@example.com", At: slots[1].reset},
+		{Email: "c@example.com", At: slots[2].reset},
+	}
+	quiet := projectPool(slots, 1.0, poolLimits(), poolNow)
+	typical := projectPool(slots, 1.2, poolLimits(), poolNow)
+	busy := projectPool(slots, 1.5, poolLimits(), poolNow)
+	if typical.runsOutAt == nil || !typical.runsOutAt.After(slots[0].reset) {
+		t.Fatalf("typical runsOutAt = %v, want after a's reset at %v", typical.runsOutAt, slots[0].reset)
+	}
+	pool := PoolSummary{
+		RunsOutAt: PoolTimes{Quiet: quiet.runsOutAt, Typical: typical.runsOutAt, Busy: busy.runsOutAt},
+		NextReset: &PoolNextReset{Email: "a@example.com", At: slots[0].reset, Restores: 0.8},
+	}
+	alert, ok := poolRunsOutAlert(pool, resets, poolNow)
+	if !ok {
+		t.Fatalf("no runs-out alert with typical runsOutAt %v", typical.runsOutAt)
+	}
+	if want := "The next reset is b@example.com in 50 hours, +100%."; !strings.Contains(alert.Message, want) {
+		t.Fatalf("message = %q, want it to contain %q", alert.Message, want)
 	}
 }

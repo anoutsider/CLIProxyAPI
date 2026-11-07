@@ -281,8 +281,12 @@ func BuildPoolForecast(in PoolForecastInput) PoolForecast {
 		}
 	}
 
+	resets := make([]PoolNextReset, len(slots))
+	for slot, i := range slotAccount {
+		resets[slot] = PoolNextReset{Email: in.Accounts[i].Email, At: slots[slot].reset.UTC().Truncate(time.Second)}
+	}
 	out.Alerts = append(out.Alerts, poolSignInAlerts(in.Accounts, out.Accounts)...)
-	if alert, ok := poolRunsOutAlert(out.Pool, now); ok {
+	if alert, ok := poolRunsOutAlert(out.Pool, resets, now); ok {
 		out.Alerts = append(out.Alerts, alert)
 	}
 	return out
@@ -662,13 +666,12 @@ func poolSignInAlerts(accounts []PoolAccount, views []PoolForecastAccount) []Poo
 }
 
 // poolRunsOutAlert fires when the typical-day projection empties every account
-// within 72 hours and before the next reset restores quota.
-func poolRunsOutAlert(pool PoolSummary, now time.Time) (PoolAlert, bool) {
+// within 72 hours; the projection has already applied the resets before then.
+// The message names the first of resets after the busy-day run-out, or
+// pool.NextReset when the busy day does not run out.
+func poolRunsOutAlert(pool PoolSummary, resets []PoolNextReset, now time.Time) (PoolAlert, bool) {
 	typical := pool.RunsOutAt.Typical
 	if typical == nil || typical.Sub(now) > poolRunsOutAlertTime {
-		return PoolAlert{}, false
-	}
-	if pool.NextReset != nil && !typical.Before(pool.NextReset.At) {
 		return PoolAlert{}, false
 	}
 	hours := func(at time.Time) int { return int(math.Round(at.Sub(now).Hours())) }
@@ -681,7 +684,13 @@ func poolRunsOutAlert(pool PoolSummary, now time.Time) (PoolAlert, bool) {
 		span = fmt.Sprintf("%d to %d hours", hours(busy), hours(*pool.RunsOutAt.Quiet))
 	}
 	message := fmt.Sprintf("Claude quota runs out in %s (busy day to quiet day).", span)
-	if next := pool.NextReset; next != nil {
+	next := pool.NextReset
+	if pool.RunsOutAt.Busy != nil {
+		if reset, ok := poolResetAfter(resets, busy); ok {
+			next = &reset
+		}
+	}
+	if next != nil {
 		gap := int(math.Round(next.At.Sub(busy).Hours()))
 		if gap < 0 {
 			gap = 0
@@ -689,6 +698,23 @@ func poolRunsOutAlert(pool PoolSummary, now time.Time) (PoolAlert, bool) {
 		message += fmt.Sprintf(" The next reset is %s in %d hours, +%d%%. Expect up to %d hours with no Claude quota.", next.Email, hours(next.At), int(math.Round(next.Restores*100)), gap)
 	}
 	return PoolAlert{Kind: PoolAlertRunsOut, Key: "runs-out:" + typical.UTC().Format("2006-01-02"), Message: message}, true
+}
+
+// poolResetAfter returns the earliest reset after at, each account's reset moved
+// on by 7-day steps. Every account is full at a run-out, so it restores 100%.
+func poolResetAfter(resets []PoolNextReset, at time.Time) (PoolNextReset, bool) {
+	var first PoolNextReset
+	found := false
+	for _, reset := range resets {
+		next := reset.At
+		for !next.After(at) {
+			next = next.Add(poolSevenDays)
+		}
+		if !found || next.Before(first.At) {
+			first, found = PoolNextReset{Email: reset.Email, At: next, Restores: 1}, true
+		}
+	}
+	return first, found
 }
 
 // poolSignInSeen records when a refused login was first seen, for accounts whose
