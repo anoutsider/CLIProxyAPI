@@ -469,7 +469,19 @@ func TestApplyClaudeHeaders_AdvisorToolBetaRepositionedWhenOutOfOrder(t *testing
 
 	body := []byte(`{"model":"claude-opus-5","tools":[{"type":"advisor_20260301","name":"advisor"}]}`)
 
-	for _, confirmed := range []bool{false, true} {
+	// A confirmed native client keeps its own order (#2824); only an unconfirmed
+	// caller's advisor beta is moved to the measured position.
+	confirmedReq := newClaudeHeaderTestRequest(t, nil)
+	if err := applyClaudeHeaders(confirmedReq, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, false, nil,
+		body, nil, incoming, true); err != nil {
+		t.Fatalf("confirmed=true: applyClaudeHeaders() error = %v", err)
+	}
+	wantConfirmed := "claude-code-20250219,oauth-2025-04-20,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,advisor-tool-2026-03-01,extended-cache-ttl-2025-04-11"
+	if got := confirmedReq.Header.Get("Anthropic-Beta"); got != wantConfirmed {
+		t.Fatalf("confirmed=true: Anthropic-Beta = %q, want caller order kept as %q", got, wantConfirmed)
+	}
+
+	for _, confirmed := range []bool{false} {
 		req := newClaudeHeaderTestRequest(t, nil)
 		if err := applyClaudeHeaders(req, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, false, nil,
 			body, nil, incoming, confirmed); err != nil {

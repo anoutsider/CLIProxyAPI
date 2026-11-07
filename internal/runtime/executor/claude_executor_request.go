@@ -1273,7 +1273,7 @@ func applyClaudeHeadersWithNativeProfile(
 			baseBetas = withClaudeOAuthCredentialBetas(baseBetas, false)
 		}
 	}
-	if preserveCallerFingerprint && advisorNeeded {
+	if preserveCallerFingerprint && advisorNeeded && !callerBetas[claudeAdvisorToolBeta] {
 		baseBetas = withClaudeAdvisorToolBeta(baseBetas)
 	}
 	if !claudeRequestSupportsEffort(body, nil) {

@@ -11,14 +11,16 @@ import (
 // set and order, including effort on Haiku and on helper requests.
 func TestApplyClaudeHeaders_ConfirmedClientBetasForwardedUnchanged(t *testing.T) {
 	for _, tt := range []struct {
-		name  string
-		betas string
-		body  string
+		name   string
+		betas  string
+		body   string
+		helper bool
 	}{
 		{
-			name:  "haiku helper",
-			betas: "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,effort-2025-11-24,structured-outputs-2025-12-15",
-			body:  `{"model":"claude-haiku-5-5","output_config":{"format":{"type":"json_schema"}}}`,
+			name:   "haiku helper",
+			betas:  "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,effort-2025-11-24,structured-outputs-2025-12-15",
+			body:   `{"model":"claude-haiku-5-5","output_config":{"format":{"type":"json_schema"}}}`,
+			helper: true,
 		},
 		{
 			name:  "haiku main",
@@ -26,9 +28,10 @@ func TestApplyClaudeHeaders_ConfirmedClientBetasForwardedUnchanged(t *testing.T)
 			body:  `{"model":"claude-haiku-5-5","thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}}`,
 		},
 		{
-			name:  "opus helper",
-			betas: "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,effort-2025-11-24,structured-outputs-2025-12-15",
-			body:  `{"model":"claude-opus-5-5","output_config":{"format":{"type":"json_schema"}}}`,
+			name:   "opus helper",
+			betas:  "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,effort-2025-11-24,structured-outputs-2025-12-15",
+			body:   `{"model":"claude-opus-5-5","output_config":{"format":{"type":"json_schema"}}}`,
+			helper: true,
 		},
 		{
 			name:  "opus main",
@@ -40,20 +43,20 @@ func TestApplyClaudeHeaders_ConfirmedClientBetasForwardedUnchanged(t *testing.T)
 			incoming := http.Header{}
 			incoming.Set("Anthropic-Beta", tt.betas)
 			req := newClaudeHeaderTestRequest(t, nil)
-			if err := applyClaudeHeaders(req, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, true, nil,
-				[]byte(tt.body), nil, incoming, true); err != nil {
-				t.Fatalf("applyClaudeHeaders() error = %v", err)
+			if err := applyClaudeHeadersWithNativeProfile(req, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, true, nil,
+				[]byte(tt.body), nil, incoming, true, tt.helper); err != nil {
+				t.Fatalf("applyClaudeHeadersWithNativeProfile() error = %v", err)
 			}
-			got := req.Header.Get("Anthropic-Beta")
-			if !strings.HasPrefix(got, tt.betas) {
-				t.Fatalf("Anthropic-Beta = %q, want the caller's list %q unchanged at the front", got, tt.betas)
+			if got := req.Header.Get("Anthropic-Beta"); got != tt.betas {
+				t.Fatalf("Anthropic-Beta = %q, want the caller's list %q unchanged", got, tt.betas)
 			}
 		})
 	}
 }
 
-// A confirmed client that omits a beta its request needs still gets it added,
-// and a gated beta the proxy would add itself stays gated.
+// Regression guard, true before and after #2824: a confirmed client that omits a
+// beta its request needs still gets it added, and a gated beta the proxy would
+// add itself stays gated.
 func TestApplyClaudeHeaders_ConfirmedClientStillGetsProxyBetasGated(t *testing.T) {
 	incoming := http.Header{}
 	incoming.Set("Anthropic-Beta", claudeCodeBeta+",interleaved-thinking-2025-05-14")
