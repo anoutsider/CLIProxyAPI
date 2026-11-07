@@ -84,14 +84,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	case "soonest-reset", "soonestreset":
 		state.strategy = "soonest-reset"
 		state.soonestResetThreshold = cfg.Routing.SoonestResetThreshold
-		if window := strings.TrimSpace(cfg.Routing.SoonestResetDrainWindow); window != "" {
-			if parsed, errParse := time.ParseDuration(window); errParse == nil {
-				if parsed <= 0 {
-					parsed = -1
-				}
-				state.soonestResetDrainWindow = parsed
-			}
-		}
+		state.soonestResetDrainWindow = coreauth.ParseSoonestResetDrainWindow(cfg.Routing.SoonestResetDrainWindow)
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
