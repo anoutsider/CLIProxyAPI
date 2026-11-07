@@ -21,6 +21,11 @@ const DefaultSoonestResetThreshold = 0.9
 // within it; one that does not drops behind the accounts with data.
 const soonestResetProbeWindow = 10 * time.Minute
 
+// soonestResetReprobeInterval is how long after a probe an account without data
+// can be tried again, for example after its first request failed. It also bounds
+// how long the entry of a removed account is kept.
+const soonestResetReprobeInterval = time.Hour
+
 const (
 	claudeSevenDayUtilizationSignal = "Anthropic-Ratelimit-Unified-7d-Utilization"
 	claudeSevenDayResetSignal       = "Anthropic-Ratelimit-Unified-7d-Reset"
@@ -214,6 +219,11 @@ func (c resetCandidate) remainingPerHour(now time.Time) float64 {
 // each account without data was first tried; entries of accounts with data are
 // removed, so an account whose window resets can be tried again.
 func pickSoonestReset(available []*Auth, model string, threshold float64, now time.Time, probed map[string]time.Time) (*Auth, bool) {
+	for authID, first := range probed {
+		if now.Sub(first) >= soonestResetReprobeInterval {
+			delete(probed, authID)
+		}
+	}
 	candidates := make([]resetCandidate, 0, len(available))
 	anyKnown := false
 	for i, auth := range available {

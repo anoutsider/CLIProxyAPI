@@ -258,6 +258,9 @@ func TestSoonestResetSelectorProbeWindowExpires(t *testing.T) {
 	if got := pickAt(start.Add(11 * time.Minute)); got != "b-known" {
 		t.Fatalf("pick after the probe window %q, want b-known", got)
 	}
+	if got := pickAt(start.Add(61 * time.Minute)); got != "z-unknown" {
+		t.Fatalf("pick an hour after the probe %q, want z-unknown tried again", got)
+	}
 }
 
 // When both sources hold the seven-day window, the newer one decides.

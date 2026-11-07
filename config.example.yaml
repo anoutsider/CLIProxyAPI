@@ -172,9 +172,10 @@ routing:
   # soonest, skipping accounts at or above soonest-reset-threshold on that window or on the
   # requested model's weekly window (for example Fable). The seven-day window comes from response
   # headers and from polling /api/oauth/usage, whichever is newer; per-model windows come from the
-  # poll only. The poll runs at most every 15 minutes per OAuth account, with backoff on 429. A
-  # Claude OAuth account with no data yet is tried first, for up to 10 minutes, so a response
-  # supplies its data; other accounts without data rank last.
+  # poll only. The poll runs at most every 15 minutes per OAuth account, with backoff on 429. When
+  # some accounts have data, a Claude OAuth account without data is tried first for up to 10
+  # minutes, so a response supplies its data, and again an hour later if none arrived; other
+  # accounts without data rank last. When no account has data, accounts rotate round-robin.
   soonest-reset-threshold: 0.9 # fraction from 0 to 1; default 0.9
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
