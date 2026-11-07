@@ -1217,6 +1217,23 @@ func applyClaudeHeadersWithNativeProfile(
 	}
 	requestedMap := claudeRequestedBetas(incomingBetas, extraBetas)
 	advisorNeeded := requestedMap[claudeAdvisorToolBeta] || claudeBodyHasAdvisorTool(body)
+	// A confirmed native client's own betas are kept in place: its version, not the
+	// pinned profile, knows which betas its request needs. Only betas the proxy adds
+	// for its own credential are subject to the gating below.
+	callerBetas := make(map[string]bool)
+	if confirmedClaudeCode {
+		for _, beta := range strings.Split(incomingBetas, ",") {
+			if beta = strings.TrimSpace(beta); beta != "" {
+				callerBetas[beta] = true
+			}
+		}
+	}
+	dropBeta := func(betas, beta string) string {
+		if callerBetas[beta] {
+			return betas
+		}
+		return withoutClaudeBeta(betas, beta)
+	}
 
 	baseBetas := incomingBetas
 	if !preserveCallerFingerprint {
@@ -1230,7 +1247,7 @@ func applyClaudeHeadersWithNativeProfile(
 	}
 	if confirmedClaudeCode && incomingBetas != "" {
 		baseBetas = incomingBetas
-		if advisorNeeded {
+		if advisorNeeded && !callerBetas[claudeAdvisorToolBeta] {
 			baseBetas = withClaudeAdvisorToolBeta(baseBetas)
 		}
 		// Measured Haiku helper requests already carry their own cache-ttl beta
@@ -1256,11 +1273,11 @@ func applyClaudeHeadersWithNativeProfile(
 			baseBetas = withClaudeOAuthCredentialBetas(baseBetas, false)
 		}
 	}
-	if preserveCallerFingerprint && advisorNeeded {
+	if preserveCallerFingerprint && advisorNeeded && !callerBetas[claudeAdvisorToolBeta] {
 		baseBetas = withClaudeAdvisorToolBeta(baseBetas)
 	}
 	if !claudeRequestSupportsEffort(body, nil) {
-		baseBetas = withoutClaudeBeta(baseBetas, claudeEffortBeta)
+		baseBetas = dropBeta(baseBetas, claudeEffortBeta)
 	}
 	existingSet := make(map[string]bool)
 	for _, beta := range strings.Split(baseBetas, ",") {
@@ -1334,27 +1351,27 @@ func applyClaudeHeadersWithNativeProfile(
 		}
 		// Enforce strict native Claude Code 2.1.280 model & turn beta gating:
 		if !claudeRequestSupportsEffort(body, nil) {
-			baseBetas = withoutClaudeBeta(baseBetas, claudeEffortBeta)
+			baseBetas = dropBeta(baseBetas, claudeEffortBeta)
 		}
 		reqProbeOrHelper := helps.IsClaudeProbeOrHelperRequest(body)
 		if reqProbeOrHelper && !helperProfile {
-			baseBetas = withoutClaudeBeta(baseBetas, claudeServerSideFallbackBeta)
-			baseBetas = withoutClaudeBeta(baseBetas, claudeThinkingDisplayUpdatesBeta)
-			baseBetas = withoutClaudeBeta(baseBetas, claudeExtendedCacheTTLBeta)
+			baseBetas = dropBeta(baseBetas, claudeServerSideFallbackBeta)
+			baseBetas = dropBeta(baseBetas, claudeThinkingDisplayUpdatesBeta)
+			baseBetas = dropBeta(baseBetas, claudeExtendedCacheTTLBeta)
 		}
 		reqThinkingType := ojson.GetBytesNoCopy(body, "thinking.type").String()
 		if reqThinkingType == "disabled" {
-			baseBetas = withoutClaudeBeta(baseBetas, claudeThinkingDisplayUpdatesBeta)
+			baseBetas = dropBeta(baseBetas, claudeThinkingDisplayUpdatesBeta)
 		}
 		if helps.IsClaudeSubagentRequest(incomingHeaders, body) && !helps.ClaudeSubagentRequests1h(incomingHeaders, body) {
-			baseBetas = withoutClaudeBeta(baseBetas, claudeExtendedCacheTTLBeta)
+			baseBetas = dropBeta(baseBetas, claudeExtendedCacheTTLBeta)
 		}
 		if !reqProbeOrHelper && !countTokens && helps.ClaudePayloadHas1hTTL(body) {
 			baseBetas = withClaudeExtendedCacheTTLBeta(baseBetas)
 		}
 		reqModel := strings.ToLower(strings.TrimSpace(ojson.GetBytesNoCopy(body, "model").String()))
 		if isClaudeHaikuModel(reqModel) && !ojson.GetBytesNoCopy(body, "fallbacks").Exists() && !helperProfile {
-			baseBetas = withoutClaudeBeta(baseBetas, claudeServerSideFallbackBeta)
+			baseBetas = dropBeta(baseBetas, claudeServerSideFallbackBeta)
 		}
 		// A body carrying thinking.block_binding is rejected upstream unless
 		// the binding-controls beta travels with it, in every fingerprint
