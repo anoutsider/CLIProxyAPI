@@ -127,10 +127,10 @@ func TestSoonestResetSelectorTreatsPassedResetAsUnknown(t *testing.T) {
 	t.Parallel()
 	got := pickSoonest(t, &SoonestResetSelector{}, "claude-opus-5-5",
 		soonestResetAuth("a-current", "0.50", 1*24*time.Hour),
-		soonestResetAuth("z-stale", "0.10", -time.Hour),
+		soonestResetAuth("z-stale", "0.95", -time.Hour),
 	)
 	if got != "z-stale" {
-		t.Fatalf("picked %q, want z-stale: its window has reset, so it is tried for fresh data", got)
+		t.Fatalf("picked %q, want z-stale: its window has reset, so its old 95%% no longer applies", got)
 	}
 }
 

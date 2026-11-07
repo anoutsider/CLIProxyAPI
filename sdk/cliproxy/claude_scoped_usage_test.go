@@ -106,16 +106,30 @@ func TestClaudeScopedUsagePollerBacksOffOnRateLimit(t *testing.T) {
 }
 
 func TestClaudeScopedUsagePollerRunsOnlyUnderSoonestReset(t *testing.T) {
-	calls := 0
-	service := &Service{cfg: &config.Config{}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{ID: "polled", Provider: "claude", Status: coreauth.StatusActive, Metadata: map[string]any{"access_token": "fixture"}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { coreauth.ClearClaudeScopedWindows("polled") })
+	service := &Service{cfg: &config.Config{}, coreManager: manager}
 	p := newClaudeScopedUsagePoller(service)
+	calls := 0
 	p.fetch = func(context.Context, *config.Config, *coreauth.Auth) (claudeUsageResult, error) {
 		calls++
 		return claudeUsageResult{status: http.StatusOK}, nil
 	}
-	p.tick(context.Background(), time.Now())
+	now := time.Now()
+	p.tick(context.Background(), now)
 	if calls != 0 {
 		t.Fatalf("poller fetched %d times under round-robin, want none", calls)
+	}
+	soonest := &config.Config{}
+	soonest.Routing.Strategy = "soonest-reset"
+	service.cfg = soonest
+	p.tick(context.Background(), now)
+	p.tick(context.Background(), now.Add(time.Minute))
+	if calls != 1 {
+		t.Fatalf("poller fetched %d times under soonest-reset within 15 minutes, want 1", calls)
 	}
 }
 

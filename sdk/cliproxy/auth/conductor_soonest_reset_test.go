@@ -12,14 +12,27 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-// Drives the real Manager with session affinity around SoonestResetSelector.
+// Drives the real Manager around SoonestResetSelector, with and without session
+// affinity: only the plain case passes the selector through as a built-in would not.
 // The accounts start with no data, learn their seven-day windows from response
 // headers through MarkResult, and new sessions then follow the reset times and
 // the requested model's window.
 func TestManagerSoonestResetLearnsWindowsFromResponses(t *testing.T) {
+	for _, affinity := range []bool{true, false} {
+		t.Run(map[bool]string{true: "session-affinity", false: "plain"}[affinity], func(t *testing.T) {
+			runManagerSoonestReset(t, affinity)
+		})
+	}
+}
+
+func runManagerSoonestReset(t *testing.T, affinity bool) {
 	ctx := internallogging.WithResponseHeadersHolder(context.Background())
-	selector := NewSessionAffinitySelector(&SoonestResetSelector{})
-	t.Cleanup(selector.Stop)
+	var selector Selector = &SoonestResetSelector{}
+	if affinity {
+		wrapped := NewSessionAffinitySelector(selector)
+		t.Cleanup(wrapped.Stop)
+		selector = wrapped
+	}
 	manager := NewManager(nil, selector, nil)
 	manager.SetRetryConfig(0, 0, 0)
 
@@ -78,7 +91,12 @@ func TestManagerSoonestResetLearnsWindowsFromResponses(t *testing.T) {
 	if got := execute("new-opus-2", opus); got != soonID {
 		t.Fatalf("new Opus session went to %s, want %s: a full Fable window must not bench Opus", got, soonID)
 	}
-	if got := execute("new-opus", opus); got != soonID {
-		t.Fatalf("existing session moved to %s, want it to stay bound to %s", got, soonID)
+	if !affinity {
+		return
+	}
+	SetClaudeUsageWindows(lateID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.95, ResetsAt: time.Now().Add(24 * time.Hour)}})
+	t.Cleanup(func() { ClearClaudeScopedWindows(lateID) })
+	if got := execute("new-fable", fable); got != lateID {
+		t.Fatalf("bound Fable session moved to %s, want it to stay bound to %s until a limit is returned", got, lateID)
 	}
 }
