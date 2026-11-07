@@ -114,6 +114,13 @@ func claudeScopedWindowFor(authID, model string) (ScopedWindow, bool) {
 	return ScopedWindow{}, false
 }
 
+// claudeModelWindows returns the per-model windows recorded for an account.
+func claudeModelWindows(authID string) []ScopedWindow {
+	claudeScopedWindows.mu.RLock()
+	defer claudeScopedWindows.mu.RUnlock()
+	return append([]ScopedWindow(nil), claudeScopedWindows.byAuth[authID].models...)
+}
+
 func claudeAccountWindowFor(authID string) (ScopedWindow, bool) {
 	claudeScopedWindows.mu.RLock()
 	defer claudeScopedWindows.mu.RUnlock()
@@ -165,6 +172,28 @@ func (s *SoonestResetSelector) drainWindow() time.Duration {
 	return s.DrainWindow
 }
 
+func (s *SoonestResetSelector) limits() resetLimits {
+	return resetLimits{threshold: s.threshold(), drain: s.drainWindow()}
+}
+
+// ParseSoonestResetDrainWindow reads the routing.soonest-reset-drain-window setting
+// into a SoonestResetSelector.DrainWindow: zero for the default when value is blank
+// or invalid, and a negative duration when draining is disabled.
+func ParseSoonestResetDrainWindow(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	parsed, errParse := time.ParseDuration(value)
+	if errParse != nil {
+		return 0
+	}
+	if parsed <= 0 {
+		return -1
+	}
+	return parsed
+}
+
 func (s *SoonestResetSelector) clock() time.Time {
 	if s != nil && s.now != nil {
 		return s.now()
@@ -185,7 +214,7 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 	if s.probed == nil {
 		s.probed = make(map[string]time.Time)
 	}
-	picked, learning := pickSoonestReset(available, model, resetLimits{threshold: s.threshold(), drain: s.drainWindow()}, now, s.probed)
+	picked, learning := pickSoonestReset(available, model, s.limits(), now, s.probed)
 	if picked != nil && learning {
 		if _, ok := s.probed[picked.ID]; !ok {
 			s.probed[picked.ID] = now
@@ -283,15 +312,27 @@ func pickSoonestReset(available []*Auth, model string, limits resetLimits, now t
 	if len(eligible) == 0 {
 		// Every account is past the threshold: send the session where the most
 		// quota is left rather than refusing a request the upstream may still serve.
-		sort.SliceStable(candidates, func(i, j int) bool {
-			left, right := candidates[i].fullest(), candidates[j].fullest()
-			if left != right {
-				return left < right
-			}
-			return candidates[i].order < candidates[j].order
-		})
+		sortByFullest(candidates)
 		return candidates[0].auth, false
 	}
+	sortEligible(eligible, now)
+	return eligible[0].auth, eligible[0].learns
+}
+
+// sortByFullest orders candidates least used first, for when none is eligible.
+func sortByFullest(candidates []resetCandidate) {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left, right := candidates[i].fullest(), candidates[j].fullest()
+		if left != right {
+			return left < right
+		}
+		return candidates[i].order < candidates[j].order
+	})
+}
+
+// sortEligible orders eligible candidates in routing order: soonest reset first,
+// ties by the most unused quota per hour until the reset.
+func sortEligible(eligible []resetCandidate, now time.Time) {
 	sort.SliceStable(eligible, func(i, j int) bool {
 		left, right := eligible[i], eligible[j]
 		// An account without data that can learn from a response goes first: one
@@ -312,7 +353,6 @@ func pickSoonestReset(available []*Auth, model string, limits resetLimits, now t
 		}
 		return left.order < right.order
 	})
-	return eligible[0].auth, eligible[0].learns
 }
 
 // rank orders eligible candidates: learning accounts, then accounts with data,
@@ -342,11 +382,24 @@ func resetCandidateFor(auth *Auth, order int, model string, now time.Time) reset
 	if auth == nil {
 		return candidate
 	}
-	// A window whose reset time has passed has started over, so its old
-	// utilization no longer applies and the account ranks with unknown data.
-	// Two sources give the seven-day window: response headers and the usage
-	// endpoint's account-wide window. The newer one wins. The header snapshot is
-	// held in memory only, so after a restart the polled window is all there is.
+	if window, ok := claudeSevenDayWindow(auth, now); ok {
+		candidate.known = true
+		candidate.used = window.Utilization
+		candidate.reset = window.ResetsAt
+	}
+	if window, ok := claudeScopedWindowFor(auth.ID, model); ok && window.ResetsAt.After(now) {
+		candidate.modelUsed = window.Utilization
+		candidate.modelReset = window.ResetsAt
+	}
+	return candidate
+}
+
+// claudeSevenDayWindow returns an account's seven-day window. A window whose reset
+// time has passed has started over, so its old utilization no longer applies and
+// the account has no data. Two sources give the window: response headers and the
+// usage endpoint's account-wide window. The newer one wins. The header snapshot is
+// held in memory only, so after a restart the polled window is all there is.
+func claudeSevenDayWindow(auth *Auth, now time.Time) (ScopedWindow, bool) {
 	used, okUsed := parseUtilization(auth.Quota.Signals[claudeSevenDayUtilizationSignal])
 	reset, okReset := parseUnixSeconds(auth.Quota.Signals[claudeSevenDayResetSignal])
 	headerValid := okUsed && okReset && reset.After(now)
@@ -354,19 +407,11 @@ func resetCandidateFor(auth *Auth, order int, model string, now time.Time) reset
 	windowValid := okWindow && window.ResetsAt.After(now)
 	switch {
 	case windowValid && (!headerValid || window.ObservedAt.After(auth.Quota.ObservedAt)):
-		candidate.known = true
-		candidate.used = window.Utilization
-		candidate.reset = window.ResetsAt
+		return window, true
 	case headerValid:
-		candidate.known = true
-		candidate.used = used
-		candidate.reset = reset
+		return ScopedWindow{Utilization: used, ResetsAt: reset, ObservedAt: auth.Quota.ObservedAt}, true
 	}
-	if window, ok := claudeScopedWindowFor(auth.ID, model); ok && window.ResetsAt.After(now) {
-		candidate.modelUsed = window.Utilization
-		candidate.modelReset = window.ResetsAt
-	}
-	return candidate
+	return ScopedWindow{}, false
 }
 
 // parseUtilization reads a utilization as a fraction from 0 to 1. A value above
