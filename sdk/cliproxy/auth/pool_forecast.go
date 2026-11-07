@@ -316,14 +316,9 @@ func poolAccountStates(accounts []PoolAccount, limits resetLimits, now time.Time
 				view.SevenDay.ObservedAt = &observed
 			}
 		}
-		switch {
-		case account.Disabled:
-			view.State = PoolStateDisabled
-		case !account.SignInRefusedAt.IsZero():
-			view.State = PoolStateNeedsSignIn
-		case account.SevenDay == nil || !account.SevenDay.ResetsAt.After(now):
-			view.State = PoolStateNoData
-		default:
+		if state := poolExcludedState(account, now); state != "" {
+			view.State = state
+		} else {
 			states[i].inPool = true
 			candidate := resetCandidate{order: i, known: true, used: account.SevenDay.Utilization, reset: account.SevenDay.ResetsAt, modelUsed: -1}
 			switch {
@@ -344,6 +339,20 @@ func poolAccountStates(accounts []PoolAccount, limits resetLimits, now time.Time
 		states[eligible[0].order].view.State = PoolStateNext
 	}
 	return states
+}
+
+// poolExcludedState returns the state of an account the pool leaves out, or ""
+// for an account in the pool.
+func poolExcludedState(account PoolAccount, now time.Time) string {
+	switch {
+	case account.Disabled:
+		return PoolStateDisabled
+	case !account.SignInRefusedAt.IsZero():
+		return PoolStateNeedsSignIn
+	case account.SevenDay == nil || !account.SevenDay.ResetsAt.After(now):
+		return PoolStateNoData
+	}
+	return ""
 }
 
 func poolFableWindow(models []ScopedWindow, now time.Time) (ScopedWindow, bool) {
@@ -793,13 +802,14 @@ func poolSignInFirstSeen(authID string, now time.Time) time.Time {
 	return now
 }
 
-// ClaudePoolSamples reads one pool sample per Claude OAuth account with a known
-// seven-day window, keyed by the account's email.
+// ClaudePoolSamples reads one pool sample per Claude OAuth account in the pool,
+// keyed by the account's email, so the history sums the same accounts as
+// pool.remaining.
 func ClaudePoolSamples(auths []*Auth, now time.Time) []PoolSample {
 	at := now.UTC().Truncate(PoolSampleInterval)
 	samples := make([]PoolSample, 0, len(auths))
 	for _, account := range ClaudePoolAccounts(auths, now) {
-		if account.Email == "" || account.SevenDay == nil {
+		if account.Email == "" || poolExcludedState(account, now) != "" {
 			continue
 		}
 		sample := PoolSample{At: at, Email: account.Email, Used: account.SevenDay.Utilization, ResetsAt: account.SevenDay.ResetsAt.UTC()}

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -240,5 +241,36 @@ func TestPoolDailyBurnsLeaveOutSamplingGaps(t *testing.T) {
 	}
 	if forecast.Accuracy != nil {
 		t.Fatalf("accuracy = %+v for a day without samples, want null", forecast.Accuracy)
+	}
+}
+
+func TestClaudePoolSamplesSumTheAccountsInThePool(t *testing.T) {
+	auth := func(email string, used float64, reset time.Time) *Auth {
+		return &Auth{
+			ID:       "claude-" + email + ".json",
+			Provider: "claude",
+			Metadata: map[string]any{"email": email},
+			Quota: QuotaState{Signals: map[string]string{
+				claudeSevenDayUtilizationSignal: strconv.FormatFloat(used, 'f', -1, 64),
+				claudeSevenDayResetSignal:       strconv.FormatInt(reset.Unix(), 10),
+			}},
+		}
+	}
+	serving := auth("serving@example.com", 0.4, poolNow.Add(48*time.Hour))
+	disabled := auth("disabled@example.com", 0.2, poolNow.Add(48*time.Hour))
+	disabled.Disabled = true
+	signIn := auth("sign-in@example.com", 0.2, poolNow.Add(48*time.Hour))
+	signIn.RequiresSignIn = true
+	stale := auth("stale@example.com", 0.2, poolNow.Add(-time.Hour))
+	auths := []*Auth{serving, disabled, signIn, stale}
+
+	samples := ClaudePoolSamples(auths, poolNow)
+	if len(samples) != 1 || samples[0].Email != "serving@example.com" {
+		t.Fatalf("samples = %+v, want only serving@example.com", samples)
+	}
+	forecast := BuildPoolForecast(PoolForecastInput{Now: poolNow, Accounts: ClaudePoolAccounts(auths, poolNow), History: samples})
+	last := forecast.History[len(forecast.History)-1]
+	if last.Remaining != forecast.Pool.Remaining {
+		t.Fatalf("history remaining at now = %v, pool remaining = %v; want the same", last.Remaining, forecast.Pool.Remaining)
 	}
 }
