@@ -107,14 +107,16 @@ func TestSoonestResetSelectorBreaksTieByRemainingPerHour(t *testing.T) {
 	}
 }
 
-func TestSoonestResetSelectorRanksAccountsWithoutDataLast(t *testing.T) {
+// One response teaches an account's window, so an account without data is
+// tried before the known ones instead of waiting for a poll.
+func TestSoonestResetSelectorTriesAccountsWithoutDataFirst(t *testing.T) {
 	t.Parallel()
 	got := pickSoonest(t, &SoonestResetSelector{}, "claude-opus-5-5",
-		soonestResetAuth("a-unknown", "", 0),
-		soonestResetAuth("b-known", "0.50", 5*24*time.Hour),
+		soonestResetAuth("b-known", "0.50", 1*24*time.Hour),
+		soonestResetAuth("z-unknown", "", 0),
 	)
-	if got != "b-known" {
-		t.Fatalf("picked %q, want b-known", got)
+	if got != "z-unknown" {
+		t.Fatalf("picked %q, want z-unknown", got)
 	}
 	if got := pickSoonest(t, &SoonestResetSelector{}, "claude-opus-5-5", soonestResetAuth("only-unknown", "", 0)); got != "only-unknown" {
 		t.Fatalf("picked %q, want only-unknown", got)
@@ -124,11 +126,11 @@ func TestSoonestResetSelectorRanksAccountsWithoutDataLast(t *testing.T) {
 func TestSoonestResetSelectorTreatsPassedResetAsUnknown(t *testing.T) {
 	t.Parallel()
 	got := pickSoonest(t, &SoonestResetSelector{}, "claude-opus-5-5",
-		soonestResetAuth("a-stale", "0.10", -time.Hour),
-		soonestResetAuth("b-current", "0.50", 5*24*time.Hour),
+		soonestResetAuth("a-current", "0.50", 1*24*time.Hour),
+		soonestResetAuth("z-stale", "0.10", -time.Hour),
 	)
-	if got != "b-current" {
-		t.Fatalf("picked %q, want b-current", got)
+	if got != "z-stale" {
+		t.Fatalf("picked %q, want z-stale: its window has reset, so it is tried for fresh data", got)
 	}
 }
 

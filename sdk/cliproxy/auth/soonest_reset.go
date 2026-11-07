@@ -110,8 +110,10 @@ func claudeAccountWindowFor(authID string) (ScopedWindow, bool) {
 // SoonestResetSelector sends each new session to the eligible account whose
 // seven-day window resets soonest, so quota that is about to reset is spent
 // first. An account is eligible while its seven-day window, and the requested
-// model's weekly window when one is known, are below Threshold. When no
-// candidate has window data, as for non-Claude providers, it rotates round-robin.
+// model's weekly window when one is known, are below Threshold. An eligible
+// account without seven-day data is tried first, so its next response supplies
+// the data. When no candidate has window data, as for non-Claude providers, it
+// rotates round-robin.
 type SoonestResetSelector struct {
 	// Threshold is the utilization, from 0 to 1, at which an account stops
 	// receiving new sessions. Zero means DefaultSoonestResetThreshold.
@@ -214,8 +216,10 @@ func pickSoonestReset(available []*Auth, model string, threshold float64, now ti
 	}
 	sort.SliceStable(eligible, func(i, j int) bool {
 		left, right := eligible[i], eligible[j]
+		// An account without data goes first: one response teaches its window,
+		// whereas ranking it last would leave it unused until a poll succeeds.
 		if left.known != right.known {
-			return left.known
+			return !left.known
 		}
 		if !left.known {
 			return left.order < right.order
