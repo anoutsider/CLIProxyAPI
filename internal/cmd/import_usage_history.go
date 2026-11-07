@@ -30,8 +30,9 @@ var CswapSlotEmails = map[string]string{
 	"10": "digitalbridgestech@gmail.com",
 }
 
-// cswapResetDrop is the fall in seven-day percent between two readings taken as a reset.
-const cswapResetDrop = 30
+// cswapResetDrop is the fall in seven-day percent between two readings taken as
+// a reset, the fall the forecast's burn takes as a reset.
+const cswapResetDrop = coreauth.PoolResetDrop * 100
 
 const cswapWeek = 7 * 24 * time.Hour
 
@@ -89,7 +90,9 @@ type cswapReading struct {
 // "ts" and "windowsPct", a map from slot to {"7d": percent, "Fable": percent}. It
 // keeps the last reading of each account in each 10-minute interval. The file has
 // no reset times, so each account's resets are inferred from drops of more than
-// 30 points, with 7-day steps from the nearest one.
+// 30 points. Each reading's reset is the reset of the window it was read in: the
+// next drop after it, moved back by 7-day steps while still after it, or after
+// the last drop, that reset moved on by 7-day steps.
 func ParseCswapPollHistory(r io.Reader, slotEmails map[string]string) ([]coreauth.PoolSample, error) {
 	readings := make(map[string][]cswapReading)
 	scanner := bufio.NewScanner(r)
@@ -135,18 +138,22 @@ func ParseCswapPollHistory(r io.Reader, slotEmails map[string]string) ([]coreaut
 	for email, series := range readings {
 		sort.SliceStable(series, func(i, j int) bool { return series[i].at.Before(series[j].at) })
 		resets := inferCswapResets(series)
-		byInterval := make(map[time.Time]cswapReading)
-		for _, reading := range series {
-			byInterval[reading.at.Truncate(coreauth.PoolSampleInterval)] = reading
+		byInterval := make(map[time.Time]coreauth.PoolSample)
+		for index, reading := range series {
+			reset := cswapWindowReset(resets, index, reading.at)
+			sample := coreauth.PoolSample{
+				At:       reading.at.Truncate(coreauth.PoolSampleInterval),
+				Email:    email,
+				State:    coreauth.PoolSampleInPool,
+				SevenDay: &coreauth.PoolSampleWindow{Used: reading.used / 100, ResetsAt: reset, ObservedAt: reading.at},
+			}
+			if reading.fable != nil {
+				sample.Fable = &coreauth.PoolSampleWindow{Used: *reading.fable, ResetsAt: reset, ObservedAt: reading.at}
+			}
+			byInterval[sample.At] = sample
 		}
-		for at, reading := range byInterval {
-			samples = append(samples, coreauth.PoolSample{
-				At:        at,
-				Email:     email,
-				Used:      reading.used / 100,
-				ResetsAt:  nextCswapReset(resets, reading.at),
-				FableUsed: reading.fable,
-			})
+		for _, sample := range byInterval {
+			samples = append(samples, sample)
 		}
 	}
 	sort.SliceStable(samples, func(i, j int) bool {
@@ -158,12 +165,19 @@ func ParseCswapPollHistory(r io.Reader, slotEmails map[string]string) ([]coreaut
 	return samples, nil
 }
 
-// inferCswapResets returns the reset times of one account, oldest first. A drop
+// cswapReset is an inferred reset: its time, and the index of the first reading
+// after the drop.
+type cswapReset struct {
+	at    time.Time
+	after int
+}
+
+// inferCswapResets returns the resets of one account, oldest first. A drop
 // between two readings is placed at a 7-day step from the previous reset when one
 // falls between them, otherwise at the hour of the later reading when it came
 // within cswapResetHourLag of the hour, and else at the later reading.
-func inferCswapResets(series []cswapReading) []time.Time {
-	var resets []time.Time
+func inferCswapResets(series []cswapReading) []cswapReset {
+	var resets []cswapReset
 	for i := 1; i < len(series); i++ {
 		prev, next := series[i-1], series[i]
 		if prev.used-next.used <= cswapResetDrop {
@@ -171,7 +185,7 @@ func inferCswapResets(series []cswapReading) []time.Time {
 		}
 		reset := time.Time{}
 		if len(resets) > 0 {
-			for step := resets[len(resets)-1].Add(cswapWeek); !step.After(next.at); step = step.Add(cswapWeek) {
+			for step := resets[len(resets)-1].at.Add(cswapWeek); !step.After(next.at); step = step.Add(cswapWeek) {
 				if step.After(prev.at) {
 					reset = step
 					break
@@ -184,26 +198,28 @@ func inferCswapResets(series []cswapReading) []time.Time {
 				reset = next.at.Truncate(time.Minute)
 			}
 		}
-		resets = append(resets, reset)
+		resets = append(resets, cswapReset{at: reset, after: i})
 	}
 	return resets
 }
 
-// nextCswapReset is the first reset after at: the next inferred reset moved back
-// by 7-day steps while still after at, or the last one moved forward.
-func nextCswapReset(resets []time.Time, at time.Time) time.Time {
+// cswapWindowReset is the reset of the window that reading index, taken at at,
+// was read in. A reading before a drop belongs to the window that drop ends,
+// also when the reset is placed at the hour just before the reading, because a
+// poll reads the old value for a few minutes after a reset.
+func cswapWindowReset(resets []cswapReset, index int, at time.Time) time.Time {
 	if len(resets) == 0 {
 		return time.Time{}
 	}
-	index := sort.Search(len(resets), func(i int) bool { return resets[i].After(at) })
-	if index < len(resets) {
-		reset := resets[index]
+	next := sort.Search(len(resets), func(i int) bool { return resets[i].after > index })
+	if next < len(resets) {
+		reset := resets[next].at
 		for reset.Add(-cswapWeek).After(at) {
 			reset = reset.Add(-cswapWeek)
 		}
 		return reset
 	}
-	reset := resets[len(resets)-1]
+	reset := resets[len(resets)-1].at
 	for !reset.After(at) {
 		reset = reset.Add(cswapWeek)
 	}

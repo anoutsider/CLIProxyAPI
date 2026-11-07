@@ -87,12 +87,17 @@ func TestProjectPoolRunsOutAtNullWhenCapacityOutlastsSevenDays(t *testing.T) {
 	}
 }
 
+// poolInPoolSample is an in-pool sample whose seven-day window was read at at.
+func poolInPoolSample(at time.Time, email string, used float64, reset time.Time) PoolSample {
+	return PoolSample{At: at, Email: email, State: PoolSampleInPool, SevenDay: &PoolSampleWindow{Used: used, ResetsAt: reset, ObservedAt: at}}
+}
+
 // poolHistoryFrom returns one account's samples every 10 minutes from start to
 // end, burning 0.1 a day with a reset far ahead.
 func poolHistoryFrom(start, end time.Time) []PoolSample {
 	var samples []PoolSample
 	for at := start; !at.After(end); at = at.Add(PoolSampleInterval) {
-		samples = append(samples, PoolSample{At: at, Email: "a@example.com", Used: 0.1 * at.Sub(start).Hours() / 24, ResetsAt: end.Add(24 * time.Hour)})
+		samples = append(samples, poolInPoolSample(at, "a@example.com", 0.1*at.Sub(start).Hours()/24, end.Add(24*time.Hour)))
 	}
 	return samples
 }
@@ -165,14 +170,13 @@ func TestPoolHistoryRoundTripsThroughKVStore(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 	history := &PoolHistory{client: func() (kvstore.KVClient, bool, error) { return store, true, nil }}
 	ctx := context.Background()
-	old := PoolSample{At: poolNow.Add(-PoolHistoryRetention - 48*time.Hour), Email: "a@example.com", Used: 0.1}
-	first := PoolSample{At: poolNow.Add(-26 * time.Hour), Email: "a@example.com", Used: 0.2, ResetsAt: poolNow.Add(time.Hour)}
+	old := poolInPoolSample(poolNow.Add(-PoolHistoryRetention-48*time.Hour), "a@example.com", 0.1, time.Time{})
+	first := poolInPoolSample(poolNow.Add(-26*time.Hour), "a@example.com", 0.2, poolNow.Add(time.Hour))
 	if errAppend := history.Append(ctx, []PoolSample{old, first}, poolNow); errAppend != nil {
 		t.Fatal(errAppend)
 	}
-	replaced := first
-	replaced.Used = 0.3
-	second := PoolSample{At: poolNow.Add(-time.Hour), Email: "a@example.com", Used: 0.4, ResetsAt: poolNow.Add(time.Hour)}
+	replaced := poolInPoolSample(first.At, first.Email, 0.3, first.SevenDay.ResetsAt)
+	second := poolInPoolSample(poolNow.Add(-time.Hour), "a@example.com", 0.4, poolNow.Add(time.Hour))
 	if errAppend := history.Append(ctx, []PoolSample{replaced, second}, poolNow); errAppend != nil {
 		t.Fatal(errAppend)
 	}
@@ -180,7 +184,7 @@ func TestPoolHistoryRoundTripsThroughKVStore(t *testing.T) {
 	if errLoad != nil {
 		t.Fatal(errLoad)
 	}
-	if len(got) != 2 || got[0].Used != 0.3 || got[1].Used != 0.4 {
+	if len(got) != 2 || got[0].SevenDay.Used != 0.3 || got[1].SevenDay.Used != 0.4 || got[1].State != PoolSampleInPool || !got[1].SevenDay.ObservedAt.Equal(second.At) {
 		t.Fatalf("loaded %+v, want the replaced and the second sample", got)
 	}
 	ttl, ok, errTTL := store.KVTTL(ctx, poolHistoryKey(second.At))
@@ -265,8 +269,18 @@ func TestClaudePoolSamplesSumTheAccountsInThePool(t *testing.T) {
 	auths := []*Auth{serving, disabled, signIn, unseen}
 
 	samples := ClaudePoolSamples(auths, poolNow)
-	if len(samples) != 1 || samples[0].Email != "serving@example.com" {
-		t.Fatalf("samples = %+v, want only serving@example.com", samples)
+	states := map[string]string{}
+	for _, sample := range samples {
+		states[sample.Email] = sample.State
+	}
+	want := map[string]string{"serving@example.com": PoolSampleInPool, "disabled@example.com": PoolStateDisabled, "sign-in@example.com": PoolStateNeedsSignIn}
+	if len(states) != len(want) {
+		t.Fatalf("sample states = %v, want %v and no sample for the unseen account", states, want)
+	}
+	for email, state := range want {
+		if states[email] != state {
+			t.Fatalf("sample states = %v, want %v", states, want)
+		}
 	}
 	forecast := BuildPoolForecast(PoolForecastInput{Now: poolNow, Accounts: ClaudePoolAccounts(auths, poolNow), History: samples})
 	last := forecast.History[len(forecast.History)-1]
@@ -294,14 +308,17 @@ func TestPoolCountsAPassedResetAsReset(t *testing.T) {
 	nextReset := reset.Add(poolSevenDays)
 
 	samples := ClaudePoolSamples(auths, poolNow)
-	if len(samples) != 1 || samples[0].Email != "passed@example.com" || samples[0].Used != 0 || !samples[0].ResetsAt.Equal(nextReset) {
-		t.Fatalf("samples = %+v, want passed@example.com with used 0 and reset %v", samples, nextReset)
+	if len(samples) != 1 || samples[0].Email != "passed@example.com" || samples[0].State != PoolSampleInPool || samples[0].SevenDay.Used != 0.8 || !samples[0].SevenDay.ResetsAt.Equal(reset) {
+		t.Fatalf("samples = %+v, want passed@example.com in the pool as observed: used 0.8, reset %v", samples, reset)
 	}
-	if samples[0].FableUsed == nil || *samples[0].FableUsed != 0 {
-		t.Fatalf("sample Fable used = %v, want 0", samples[0].FableUsed)
+	if samples[0].Fable == nil || samples[0].Fable.Used != 0.6 {
+		t.Fatalf("sample Fable = %+v, want 0.6 as observed", samples[0].Fable)
 	}
 
-	forecast := BuildPoolForecast(PoolForecastInput{Now: poolNow, Accounts: ClaudePoolAccounts(auths, poolNow)})
+	forecast := BuildPoolForecast(PoolForecastInput{Now: poolNow, Accounts: ClaudePoolAccounts(auths, poolNow), History: samples})
+	if last := forecast.History[len(forecast.History)-1]; last.Remaining != 1 || last.FableRemaining != 1 {
+		t.Fatalf("history at now = %+v, want remaining 1 and fable 1 after the passed resets", last)
+	}
 	states := map[string]PoolForecastAccount{}
 	for _, account := range forecast.Accounts {
 		states[account.Email] = account
@@ -322,9 +339,9 @@ func TestPoolCountsAPassedResetAsReset(t *testing.T) {
 
 func TestPoolAccountsFromHistoryKeepAnAccountWithoutRecentSamples(t *testing.T) {
 	history := []PoolSample{
-		{At: poolNow.Add(-30 * time.Hour), Email: "passed@example.com", Used: 0.7, ResetsAt: poolNow.Add(-2 * time.Hour)},
-		{At: poolNow.Add(-8 * time.Hour), Email: "quiet@example.com", Used: 0.1, ResetsAt: poolNow.Add(48 * time.Hour)},
-		{At: poolNow.Add(-10 * time.Minute), Email: "fresh@example.com", Used: 0.4, ResetsAt: poolNow.Add(24 * time.Hour)},
+		poolInPoolSample(poolNow.Add(-30*time.Hour), "passed@example.com", 0.7, poolNow.Add(-2*time.Hour)),
+		poolInPoolSample(poolNow.Add(-8*time.Hour), "quiet@example.com", 0.1, poolNow.Add(48*time.Hour)),
+		poolInPoolSample(poolNow.Add(-10*time.Minute), "fresh@example.com", 0.4, poolNow.Add(24*time.Hour)),
 	}
 	accounts := PoolAccountsFromHistory(history, poolNow)
 	if len(accounts) != 3 {
@@ -357,7 +374,13 @@ func TestPoolTotalsClampUsedToOne(t *testing.T) {
 			SevenDay: &ScopedWindow{Utilization: 1.05, ResetsAt: reset},
 			Models:   []ScopedWindow{{Name: "Fable", Utilization: fable, ResetsAt: reset}},
 		}},
-		History: []PoolSample{{At: poolNow.Add(-10 * time.Minute), Email: "a@example.com", Used: 1.05, ResetsAt: reset, FableUsed: &fable}},
+		History: []PoolSample{{
+			At:       poolNow.Add(-10 * time.Minute),
+			Email:    "a@example.com",
+			State:    PoolSampleInPool,
+			SevenDay: &PoolSampleWindow{Used: 1.05, ResetsAt: reset},
+			Fable:    &PoolSampleWindow{Used: fable, ResetsAt: reset},
+		}},
 	})
 	if forecast.Pool.Remaining != 0 || forecast.Pool.FableRemaining != 0 {
 		t.Fatalf("pool remaining %v, fable %v; want 0, 0", forecast.Pool.Remaining, forecast.Pool.FableRemaining)
@@ -365,5 +388,165 @@ func TestPoolTotalsClampUsedToOne(t *testing.T) {
 	last := forecast.History[len(forecast.History)-1]
 	if last.Remaining != 0 || last.FableRemaining != 0 {
 		t.Fatalf("history remaining %v, fable %v; want 0, 0", last.Remaining, last.FableRemaining)
+	}
+}
+
+// poolHeaderAuth is a Claude account whose seven-day window was last read from
+// the response headers at observed.
+func poolHeaderAuth(email string, used float64, reset, observed time.Time) *Auth {
+	auth := &Auth{ID: "claude-" + email + ".json", Provider: "claude", Metadata: map[string]any{"email": email}}
+	poolSetHeaderWindow(auth, used, reset, observed)
+	return auth
+}
+
+func poolSetHeaderWindow(auth *Auth, used float64, reset, observed time.Time) {
+	auth.Quota = QuotaState{ObservedAt: observed, Signals: map[string]string{
+		claudeSevenDayUtilizationSignal: strconv.FormatFloat(used, 'f', -1, 64),
+		claudeSevenDayResetSignal:       strconv.FormatInt(reset.Unix(), 10),
+	}}
+}
+
+func TestPoolReadingBurn(t *testing.T) {
+	ahead := poolNow.Add(48 * time.Hour)
+	passed := poolNow.Add(-time.Hour)
+	cases := []struct {
+		name       string
+		prev, next PoolSampleWindow
+		want       float64
+	}{
+		{"a rise is its increase", PoolSampleWindow{Used: 0.4, ResetsAt: ahead}, PoolSampleWindow{Used: 0.45, ResetsAt: ahead}, 0.05},
+		{"a small fall before the reset subtracts", PoolSampleWindow{Used: 0.91, ResetsAt: ahead}, PoolSampleWindow{Used: 0.9, ResetsAt: ahead}, -0.01},
+		{"a fall of more than 0.3 is a reset", PoolSampleWindow{Used: 0.95, ResetsAt: ahead}, PoolSampleWindow{Used: 0.04, ResetsAt: ahead}, 0.04},
+		{"a small fall after the reset is a reset", PoolSampleWindow{Used: 0.2, ResetsAt: passed}, PoolSampleWindow{Used: 0.02, ResetsAt: ahead}, 0.02},
+		{"a rise after a moved reset is its increase", PoolSampleWindow{Used: 0.8, ResetsAt: passed}, PoolSampleWindow{Used: 0.85, ResetsAt: ahead}, 0.05},
+	}
+	for _, c := range cases {
+		c.next.ObservedAt = poolNow
+		if got := poolReadingBurn(c.prev, c.next, poolNow); round4(got) != c.want {
+			t.Errorf("%s: burn = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestPoolBurnCountsAMovedResetAsAnIncrease(t *testing.T) {
+	// The hub reads 0.8 with a reset at 16:00. No reading comes until 17:00, when
+	// Anthropic reports the same 0.8 with the reset moved 3 days later; then the
+	// account burns 0.05.
+	start := poolNow.Add(-6 * time.Hour)
+	oldReset := poolNow.Add(-4 * time.Hour)
+	moved := poolNow.Add(-3 * time.Hour)
+	newReset := poolNow.Add(72 * time.Hour)
+	auth := poolHeaderAuth("moved@example.com", 0.8, oldReset, start)
+	var history []PoolSample
+	for at := start; !at.After(poolNow); at = at.Add(PoolSampleInterval) {
+		if !at.Before(moved) {
+			poolSetHeaderWindow(auth, 0.8+0.05*at.Sub(moved).Hours()/3, newReset, at)
+		}
+		history = append(history, ClaudePoolSamples([]*Auth{auth}, at)...)
+	}
+	forecast := BuildPoolForecast(PoolForecastInput{Now: poolNow, Accounts: ClaudePoolAccounts([]*Auth{auth}, poolNow), History: history})
+	if got := forecast.Pool.BurnPerDay.Last24h; got != 0.05 {
+		t.Fatalf("last 24h burn = %v, want 0.05 from the rise after the moved reset", got)
+	}
+}
+
+// poolHistoryRemainingAt returns the history point at at.
+func poolHistoryRemainingAt(t *testing.T, forecast PoolForecast, at time.Time) float64 {
+	t.Helper()
+	for _, point := range forecast.History {
+		if point.At.Equal(at) {
+			return point.Remaining
+		}
+	}
+	t.Fatalf("no history point at %v", at)
+	return 0
+}
+
+func TestPoolHistoryCarriesAccountsAcrossAHubOutage(t *testing.T) {
+	// The hub is down from 30 to 10 hours before now. a's reset falls inside the
+	// outage; its first reading after it is 0.05.
+	start := poolNow.Add(-48 * time.Hour)
+	downFrom, downTo := poolNow.Add(-30*time.Hour), poolNow.Add(-10*time.Hour)
+	aReset := poolNow.Add(-20 * time.Hour)
+	bReset := poolNow.Add(72 * time.Hour)
+	var history []PoolSample
+	for at := start; !at.After(poolNow); at = at.Add(PoolSampleInterval) {
+		if at.After(downFrom) && at.Before(downTo) {
+			continue
+		}
+		if at.Before(aReset) {
+			history = append(history, poolInPoolSample(at, "a@example.com", 0.4, aReset))
+		} else {
+			history = append(history, poolInPoolSample(at, "a@example.com", 0.05, aReset.Add(poolSevenDays)))
+		}
+		history = append(history, poolInPoolSample(at, "b@example.com", 0.5, bReset))
+	}
+	forecast := BuildPoolForecast(PoolForecastInput{Now: poolNow, Accounts: PoolAccountsFromHistory(history, poolNow), History: history})
+	if len(forecast.History) != 49 {
+		t.Fatalf("history has %d points, want 49 hourly points from the first sample", len(forecast.History))
+	}
+	for _, c := range []struct {
+		at   time.Time
+		want float64
+	}{
+		{downFrom.Add(time.Hour), 1.1},
+		{aReset.Add(-time.Hour), 1.1},
+		{aReset, 1.5},
+		{downTo.Add(-time.Hour), 1.5},
+		{downTo, 1.45},
+	} {
+		if got := poolHistoryRemainingAt(t, forecast, c.at); got != c.want {
+			t.Fatalf("history at %v = %v, want %v", c.at, got, c.want)
+		}
+	}
+}
+
+func TestPoolHistoryDropsAnAccountThatNeedsSignIn(t *testing.T) {
+	start := poolNow.Add(-6 * time.Hour)
+	refused := poolNow.Add(-3 * time.Hour)
+	reset := poolNow.Add(48 * time.Hour)
+	serving := poolHeaderAuth("serving@example.com", 0.4, reset, start)
+	leaving := poolHeaderAuth("leaving@example.com", 0.2, reset, start)
+	auths := []*Auth{serving, leaving}
+	var history []PoolSample
+	for at := start; !at.After(poolNow); at = at.Add(PoolSampleInterval) {
+		if !at.Before(refused) {
+			leaving.RequiresSignIn = true
+			leaving.RenewalEventAt = refused
+		}
+		history = append(history, ClaudePoolSamples(auths, at)...)
+	}
+	forecast := BuildPoolForecast(PoolForecastInput{Now: poolNow, Accounts: ClaudePoolAccounts(auths, poolNow), History: history})
+	if got := poolHistoryRemainingAt(t, forecast, refused.Add(-time.Hour)); got != 1.4 {
+		t.Fatalf("history before the refusal = %v, want 1.4 from both accounts", got)
+	}
+	for _, at := range []time.Time{refused, poolNow} {
+		if got := poolHistoryRemainingAt(t, forecast, at); got != 0.6 {
+			t.Fatalf("history at %v = %v, want 0.6 from the serving account only", at, got)
+		}
+	}
+	if forecast.Pool.Remaining != 0.6 {
+		t.Fatalf("pool remaining = %v, want 0.6", forecast.Pool.Remaining)
+	}
+}
+
+func TestPoolAccountsFromHistoryKeepTheSampleState(t *testing.T) {
+	reset := poolNow.Add(48 * time.Hour)
+	var history []PoolSample
+	for i, at := range []time.Time{poolNow.Add(-3 * time.Hour), poolNow.Add(-2 * time.Hour), poolNow.Add(-time.Hour)} {
+		disabled := poolInPoolSample(at, "disabled@example.com", 0.2, reset)
+		refused := poolInPoolSample(at, "refused@example.com", 0.3, reset)
+		if i > 0 {
+			disabled.State = PoolStateDisabled
+			refused.State = PoolStateNeedsSignIn
+		}
+		history = append(history, disabled, refused)
+	}
+	accounts := PoolAccountsFromHistory(history, poolNow)
+	if len(accounts) != 2 || !accounts[0].Disabled || accounts[1].Disabled {
+		t.Fatalf("accounts = %+v, want disabled@example.com disabled", accounts)
+	}
+	if want := poolNow.Add(-2 * time.Hour); !accounts[1].SignInRefusedAt.Equal(want) {
+		t.Fatalf("refused@example.com refused at %v, want %v, its first needs-sign-in sample", accounts[1].SignInRefusedAt, want)
 	}
 }

@@ -20,15 +20,41 @@ const PoolSampleInterval = 10 * time.Minute
 
 const poolHistoryKeyPrefix = "pool-forecast:samples:"
 
-// PoolSample is one reading of a Claude account's weekly windows.
+// PoolSampleInPool is the PoolSample state of an account the pool counts.
+const PoolSampleInPool = "in-pool"
+
+// PoolSample is one Claude account at a sample time, with its weekly windows as
+// last observed. A window whose reset has passed is stored as observed; the
+// forecast counts it as reset when it reads the sample.
 type PoolSample struct {
 	At    time.Time `json:"at"`
 	Email string    `json:"email"`
-	// Used is the seven-day utilization, from 0 to 1.
-	Used     float64   `json:"used"`
-	ResetsAt time.Time `json:"resetsAt"`
-	// FableUsed is Fable's weekly utilization, or nil when it was not read.
-	FableUsed *float64 `json:"fableUsed,omitempty"`
+	// State is PoolSampleInPool, or the forecast state that leaves the account
+	// out of the pool: PoolStateDisabled or PoolStateNeedsSignIn.
+	State string `json:"state"`
+	// SevenDay is the seven-day window, or nil when it was never observed.
+	SevenDay *PoolSampleWindow `json:"sevenDay,omitempty"`
+	// Fable is Fable's weekly window, or nil when it was not read.
+	Fable *PoolSampleWindow `json:"fable,omitempty"`
+}
+
+// PoolSampleWindow is a weekly window as the hub observed it.
+type PoolSampleWindow struct {
+	// Used is the fraction of the window used, from 0 to 1.
+	Used       float64   `json:"used"`
+	ResetsAt   time.Time `json:"resetsAt"`
+	ObservedAt time.Time `json:"observedAt"`
+}
+
+func poolSampleWindowOf(window ScopedWindow) *PoolSampleWindow {
+	return &PoolSampleWindow{Used: window.Utilization, ResetsAt: window.ResetsAt.UTC(), ObservedAt: window.ObservedAt.UTC()}
+}
+
+func (w *PoolSampleWindow) utc() *PoolSampleWindow {
+	if w == nil {
+		return nil
+	}
+	return &PoolSampleWindow{Used: w.Used, ResetsAt: w.ResetsAt.UTC(), ObservedAt: w.ObservedAt.UTC()}
 }
 
 // PoolHistory stores pool samples in the hub's key-value store, one key per UTC
@@ -75,7 +101,8 @@ func (h *PoolHistory) Append(ctx context.Context, samples []PoolSample, now time
 	byDay := make(map[time.Time][]PoolSample)
 	for _, sample := range samples {
 		sample.At = sample.At.UTC()
-		sample.ResetsAt = sample.ResetsAt.UTC()
+		sample.SevenDay = sample.SevenDay.utc()
+		sample.Fable = sample.Fable.utc()
 		sample.Email = strings.TrimSpace(sample.Email)
 		if sample.Email == "" {
 			continue

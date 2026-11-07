@@ -24,10 +24,10 @@ type poolFixtureAccount struct {
 	resetIn    time.Duration
 	disabled   bool
 	noData     bool
-	// samplesEndAgo is how long before now the account's samples stop: the
-	// sampler writes no samples for an account out of the pool.
-	samplesEndAgo time.Duration
-	refusedAgo    time.Duration
+	// leftPoolAgo is how long before now the account left the pool. Its samples
+	// from then on carry its disabled or needs-sign-in state.
+	leftPoolAgo time.Duration
+	refusedAgo  time.Duration
 }
 
 func poolFixtureFactor(day time.Time) float64 {
@@ -90,11 +90,30 @@ func (a poolFixtureAccount) samples(from, now time.Time) []PoolSample {
 	if a.noData {
 		return nil
 	}
-	end := now.Add(-a.samplesEndAgo)
+	left := now.Add(-a.leftPoolAgo)
 	var samples []PoolSample
-	for at := from.Truncate(PoolSampleInterval); !at.After(end); at = at.Add(PoolSampleInterval) {
+	var last PoolSample
+	for at := from.Truncate(PoolSampleInterval); !at.After(now); at = at.Add(PoolSampleInterval) {
+		if a.leftPoolAgo > 0 && !at.Before(left) {
+			// Out of the pool, the account serves nothing: its last reading stands.
+			sample := last
+			sample.At = at
+			sample.State = PoolStateNeedsSignIn
+			if a.disabled {
+				sample.State = PoolStateDisabled
+			}
+			samples = append(samples, sample)
+			continue
+		}
 		used, reset := a.usedAt(at, now)
-		samples = append(samples, PoolSample{At: at, Email: a.email, Used: used, ResetsAt: reset, FableUsed: floatPtr(used * a.fableShare)})
+		last = PoolSample{
+			At:       at,
+			Email:    a.email,
+			State:    PoolSampleInPool,
+			SevenDay: &PoolSampleWindow{Used: used, ResetsAt: reset, ObservedAt: at},
+			Fable:    &PoolSampleWindow{Used: used * a.fableShare, ResetsAt: reset, ObservedAt: at},
+		}
+		samples = append(samples, last)
 	}
 	return samples
 }
@@ -114,9 +133,9 @@ var poolFixtureMixed = []poolFixtureAccount{
 	{email: "ben@example.com", used: 0.96, fableShare: 0.5, resetIn: 18 * time.Hour},
 	{email: "cal@example.com", used: 0.38, fableShare: 0.7, resetIn: 76 * time.Hour},
 	{email: "dee@example.com", used: 0.93, fableShare: 0.4, resetIn: 106 * time.Hour},
-	{email: "eli@example.com", used: 0.3, fableShare: 0.5, resetIn: 48 * time.Hour, samplesEndAgo: 20 * time.Hour, refusedAgo: 20 * time.Hour},
+	{email: "eli@example.com", used: 0.3, fableShare: 0.5, resetIn: 48 * time.Hour, leftPoolAgo: 20 * time.Hour, refusedAgo: 20 * time.Hour},
 	{email: "fay@example.com", noData: true},
-	{email: "gus@example.com", used: 0.2, fableShare: 0.5, resetIn: 120 * time.Hour, disabled: true, samplesEndAgo: 5 * 24 * time.Hour},
+	{email: "gus@example.com", used: 0.2, fableShare: 0.5, resetIn: 120 * time.Hour, disabled: true, leftPoolAgo: 5 * 24 * time.Hour},
 }
 
 // TestPoolForecastFixtures builds the forecast the hub sends in four cases and
@@ -137,7 +156,7 @@ func TestPoolForecastFixtures(t *testing.T) {
 		}
 		account.disabled = false
 		account.refusedAgo = time.Duration(18+i%3) * time.Hour
-		account.samplesEndAgo = account.refusedAgo
+		account.leftPoolAgo = account.refusedAgo
 		signIn = append(signIn, account)
 	}
 	fixtures := []struct {
@@ -172,6 +191,10 @@ func TestPoolForecastFixtures(t *testing.T) {
 			}
 			if len(forecast.Alerts) != len(signIn) {
 				t.Fatalf("alerts = %d, want one sign-in alert per account", len(forecast.Alerts))
+			}
+			last := forecast.History[len(forecast.History)-1]
+			if !last.At.Equal(poolFixtureNow.Truncate(time.Hour)) || last.Remaining != 0 {
+				t.Fatalf("last history point = %+v, want 0 at the current hour", last)
 			}
 		}},
 	}
