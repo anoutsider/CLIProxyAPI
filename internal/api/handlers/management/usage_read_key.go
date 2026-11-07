@@ -48,7 +48,7 @@ var usageReadAuthFileFields = []string{"id", "auth_index", "name", "type", "prov
 // api-call body and restores it for the handler.
 func (h *Handler) usageReadKeyAllows(c *gin.Context) bool {
 	switch c.Request.Method + " " + c.FullPath() {
-	case http.MethodGet + " /v0/management/auth-files":
+	case http.MethodGet + " /v0/management/auth-files", http.MethodGet + " /v0/management/pool-forecast":
 		return true
 	case http.MethodPost + " /v0/management/api-call":
 		return h.usageReadAPICallAllowed(c)

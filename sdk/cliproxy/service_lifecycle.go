@@ -105,6 +105,7 @@ func (s *Service) Run(ctx context.Context) error {
 		s.coreManager.StartAutoRefresh(ctx, interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 		go newClaudeScopedUsagePoller(s).run(ctx)
+		go newClaudePoolSampler(s, coreauth.DefaultPoolHistory()).run(ctx)
 	}
 
 	if !homeEnabled {
