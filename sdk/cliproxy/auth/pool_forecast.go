@@ -234,12 +234,12 @@ func BuildPoolForecast(in PoolForecastInput) PoolForecast {
 			continue
 		}
 		window := current[i].SevenDay
-		used := window.Utilization
+		used := poolClampUsed(window.Utilization)
 		slots = append(slots, poolSlot{used: used, reset: window.ResetsAt})
 		slotAccount = append(slotAccount, i)
 		out.Pool.Remaining += 1 - used
 		if fable, ok := poolFableWindow(current[i].Models, now); ok {
-			out.Pool.FableRemaining += 1 - fable.Utilization
+			out.Pool.FableRemaining += 1 - poolClampUsed(fable.Utilization)
 		}
 	}
 	out.Pool.Accounts = len(slots)
@@ -396,6 +396,11 @@ func poolRollWindow(used float64, reset, at time.Time) (float64, time.Time) {
 		reset = reset.Add(poolSevenDays)
 	}
 	return 0, reset
+}
+
+// poolClampUsed limits a used fraction to the range 0 to 1 for the pool totals.
+func poolClampUsed(used float64) float64 {
+	return math.Min(1, math.Max(0, used))
 }
 
 func poolFableWindow(models []ScopedWindow, now time.Time) (ScopedWindow, bool) {
@@ -641,13 +646,13 @@ func poolHistoryPoints(history []PoolSample, now time.Time) []PoolHistoryPoint {
 			}
 			counted++
 			used, _ := poolRollWindow(sample.Used, sample.ResetsAt, at)
-			point.Remaining += 1 - used
+			point.Remaining += 1 - poolClampUsed(used)
 			if sample.FableUsed != nil {
 				fable := *sample.FableUsed
 				if !sample.ResetsAt.After(at) {
 					fable = 0
 				}
-				point.FableRemaining += 1 - fable
+				point.FableRemaining += 1 - poolClampUsed(fable)
 			}
 		}
 		if counted == 0 {

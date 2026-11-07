@@ -345,3 +345,25 @@ func TestPoolAccountsFromHistoryKeepAnAccountWithoutRecentSamples(t *testing.T) 
 		}
 	}
 }
+
+func TestPoolTotalsClampUsedToOne(t *testing.T) {
+	reset := poolNow.Add(48 * time.Hour)
+	fable := 1.2
+	forecast := BuildPoolForecast(PoolForecastInput{
+		Now: poolNow,
+		Accounts: []PoolAccount{{
+			ID:       "a",
+			Email:    "a@example.com",
+			SevenDay: &ScopedWindow{Utilization: 1.05, ResetsAt: reset},
+			Models:   []ScopedWindow{{Name: "Fable", Utilization: fable, ResetsAt: reset}},
+		}},
+		History: []PoolSample{{At: poolNow.Add(-10 * time.Minute), Email: "a@example.com", Used: 1.05, ResetsAt: reset, FableUsed: &fable}},
+	})
+	if forecast.Pool.Remaining != 0 || forecast.Pool.FableRemaining != 0 {
+		t.Fatalf("pool remaining %v, fable %v; want 0, 0", forecast.Pool.Remaining, forecast.Pool.FableRemaining)
+	}
+	last := forecast.History[len(forecast.History)-1]
+	if last.Remaining != 0 || last.FableRemaining != 0 {
+		t.Fatalf("history remaining %v, fable %v; want 0, 0", last.Remaining, last.FableRemaining)
+	}
+}
