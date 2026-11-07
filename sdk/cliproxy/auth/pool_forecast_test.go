@@ -261,8 +261,8 @@ func TestClaudePoolSamplesSumTheAccountsInThePool(t *testing.T) {
 	disabled.Disabled = true
 	signIn := auth("sign-in@example.com", 0.2, poolNow.Add(48*time.Hour))
 	signIn.RequiresSignIn = true
-	stale := auth("stale@example.com", 0.2, poolNow.Add(-time.Hour))
-	auths := []*Auth{serving, disabled, signIn, stale}
+	unseen := &Auth{ID: "claude-unseen@example.com.json", Provider: "claude", Metadata: map[string]any{"email": "unseen@example.com"}}
+	auths := []*Auth{serving, disabled, signIn, unseen}
 
 	samples := ClaudePoolSamples(auths, poolNow)
 	if len(samples) != 1 || samples[0].Email != "serving@example.com" {
@@ -272,5 +272,76 @@ func TestClaudePoolSamplesSumTheAccountsInThePool(t *testing.T) {
 	last := forecast.History[len(forecast.History)-1]
 	if last.Remaining != forecast.Pool.Remaining {
 		t.Fatalf("history remaining at now = %v, pool remaining = %v; want the same", last.Remaining, forecast.Pool.Remaining)
+	}
+}
+
+func TestPoolCountsAPassedResetAsReset(t *testing.T) {
+	reset := poolNow.Add(-time.Hour)
+	observed := poolNow.Add(-8 * time.Hour)
+	passed := &Auth{
+		ID:       "claude-passed@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{"email": "passed@example.com"},
+		Quota: QuotaState{ObservedAt: observed, Signals: map[string]string{
+			claudeSevenDayUtilizationSignal: "0.8",
+			claudeSevenDayResetSignal:       strconv.FormatInt(reset.Unix(), 10),
+		}},
+	}
+	SetClaudeUsageWindows(passed.ID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.6, ResetsAt: reset.Add(-time.Hour), ObservedAt: observed}})
+	t.Cleanup(func() { ClearClaudeScopedWindows(passed.ID) })
+	unseen := &Auth{ID: "claude-unseen@example.com.json", Provider: "claude", Metadata: map[string]any{"email": "unseen@example.com"}}
+	auths := []*Auth{passed, unseen}
+	nextReset := reset.Add(poolSevenDays)
+
+	samples := ClaudePoolSamples(auths, poolNow)
+	if len(samples) != 1 || samples[0].Email != "passed@example.com" || samples[0].Used != 0 || !samples[0].ResetsAt.Equal(nextReset) {
+		t.Fatalf("samples = %+v, want passed@example.com with used 0 and reset %v", samples, nextReset)
+	}
+	if samples[0].FableUsed == nil || *samples[0].FableUsed != 0 {
+		t.Fatalf("sample Fable used = %v, want 0", samples[0].FableUsed)
+	}
+
+	forecast := BuildPoolForecast(PoolForecastInput{Now: poolNow, Accounts: ClaudePoolAccounts(auths, poolNow)})
+	states := map[string]PoolForecastAccount{}
+	for _, account := range forecast.Accounts {
+		states[account.Email] = account
+	}
+	if got := states["passed@example.com"]; got.State != PoolStateNext || got.SevenDay == nil || got.SevenDay.Used != 0 || !got.SevenDay.ResetsAt.Equal(nextReset) {
+		t.Fatalf("passed account = %+v, want next with used 0 and reset %v", got, nextReset)
+	}
+	if got := states["unseen@example.com"].State; got != PoolStateNoData {
+		t.Fatalf("unseen account state = %s, want no-data", got)
+	}
+	if forecast.Pool.Accounts != 1 || forecast.Pool.Remaining != 1 || forecast.Pool.FableRemaining != 1 {
+		t.Fatalf("pool = %d accounts, remaining %v, fable %v; want 1, 1, 1", forecast.Pool.Accounts, forecast.Pool.Remaining, forecast.Pool.FableRemaining)
+	}
+	if forecast.Pool.NextReset == nil || !forecast.Pool.NextReset.At.Equal(nextReset) {
+		t.Fatalf("nextReset = %+v, want %v", forecast.Pool.NextReset, nextReset)
+	}
+}
+
+func TestPoolAccountsFromHistoryKeepAnAccountWithoutRecentSamples(t *testing.T) {
+	history := []PoolSample{
+		{At: poolNow.Add(-30 * time.Hour), Email: "passed@example.com", Used: 0.7, ResetsAt: poolNow.Add(-2 * time.Hour)},
+		{At: poolNow.Add(-8 * time.Hour), Email: "quiet@example.com", Used: 0.1, ResetsAt: poolNow.Add(48 * time.Hour)},
+		{At: poolNow.Add(-10 * time.Minute), Email: "fresh@example.com", Used: 0.4, ResetsAt: poolNow.Add(24 * time.Hour)},
+	}
+	accounts := PoolAccountsFromHistory(history, poolNow)
+	if len(accounts) != 3 {
+		t.Fatalf("accounts = %+v, want 3", accounts)
+	}
+	want := map[string]struct {
+		used  float64
+		reset time.Time
+	}{
+		"passed@example.com": {0, poolNow.Add(-2*time.Hour + poolSevenDays)},
+		"quiet@example.com":  {0.1, poolNow.Add(48 * time.Hour)},
+		"fresh@example.com":  {0.4, poolNow.Add(24 * time.Hour)},
+	}
+	for _, account := range accounts {
+		w := want[account.Email]
+		if account.SevenDay.Utilization != w.used || !account.SevenDay.ResetsAt.Equal(w.reset) {
+			t.Fatalf("%s = used %v, reset %v; want %v, %v", account.Email, account.SevenDay.Utilization, account.SevenDay.ResetsAt, w.used, w.reset)
+		}
 	}
 }

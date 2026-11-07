@@ -34,8 +34,9 @@ const (
 	poolMinBurnDays      = 3
 	poolResetDrop        = 0.3
 	poolRunsOutAlertTime = 72 * time.Hour
-	// poolSampleMaxAge is how long a sample stands for an account's state when no
-	// newer one exists. An account without a sample for longer is left out.
+	// poolSampleMaxAge is how long a sample stands for an account in the history
+	// line when no newer one exists, and the longest gap between pool samples
+	// that a full day may hold.
 	poolSampleMaxAge = 6 * time.Hour
 	poolFull         = 1 - 1e-9
 )
@@ -48,9 +49,11 @@ type PoolAccount struct {
 	// SignInRefusedAt is when the account's login was first seen refused; zero
 	// when it is not refused.
 	SignInRefusedAt time.Time
-	// SevenDay is the current seven-day window, or nil when unknown.
+	// SevenDay is the last observed seven-day window, or nil when the hub has
+	// never observed one. A window whose reset has passed counts as reset.
 	SevenDay *ScopedWindow
-	// Models are the current per-model weekly windows.
+	// Models are the last observed per-model weekly windows, each counted as
+	// reset once its reset has passed.
 	Models []ScopedWindow
 }
 
@@ -192,10 +195,15 @@ type poolRun struct {
 	leftAtReset []float64
 }
 
-// BuildPoolForecast forecasts the Claude pool from the accounts' current
-// windows and the stored history.
+// BuildPoolForecast forecasts the Claude pool from the accounts' last observed
+// windows and the stored history. A window whose reset has passed counts as
+// reset: used 0, with the reset moved on by 7-day steps.
 func BuildPoolForecast(in PoolForecastInput) PoolForecast {
 	now := in.Now.UTC().Truncate(time.Second)
+	current := make([]PoolAccount, len(in.Accounts))
+	for i, account := range in.Accounts {
+		current[i] = poolAccountAt(account, now)
+	}
 	limits := (&SoonestResetSelector{Threshold: in.Threshold, DrainWindow: in.DrainWindow}).limits()
 	history := make([]PoolSample, 0, len(in.History))
 	for _, sample := range in.History {
@@ -217,7 +225,7 @@ func BuildPoolForecast(in PoolForecastInput) PoolForecast {
 		out.HistoryDays = int(math.Round(now.Sub(history[0].At).Hours() / 24))
 	}
 
-	accounts := poolAccountStates(in.Accounts, limits, now)
+	accounts := poolAccountStates(current, limits, now)
 	var slots []poolSlot
 	var slotAccount []int
 	for i, account := range accounts {
@@ -225,11 +233,12 @@ func BuildPoolForecast(in PoolForecastInput) PoolForecast {
 		if !account.inPool {
 			continue
 		}
-		window := in.Accounts[i].SevenDay
-		slots = append(slots, poolSlot{used: window.Utilization, reset: window.ResetsAt})
+		window := current[i].SevenDay
+		used := window.Utilization
+		slots = append(slots, poolSlot{used: used, reset: window.ResetsAt})
 		slotAccount = append(slotAccount, i)
-		out.Pool.Remaining += 1 - window.Utilization
-		if fable, ok := poolFableWindow(in.Accounts[i].Models, now); ok {
+		out.Pool.Remaining += 1 - used
+		if fable, ok := poolFableWindow(current[i].Models, now); ok {
 			out.Pool.FableRemaining += 1 - fable.Utilization
 		}
 	}
@@ -275,7 +284,7 @@ func BuildPoolForecast(in PoolForecastInput) PoolForecast {
 			restores = 1 - runs[1].leftAtReset[soonest]
 		}
 		out.Pool.NextReset = &PoolNextReset{
-			Email:    in.Accounts[slotAccount[soonest]].Email,
+			Email:    current[slotAccount[soonest]].Email,
 			At:       slots[soonest].reset.UTC().Truncate(time.Second),
 			Restores: round4(restores),
 		}
@@ -283,9 +292,9 @@ func BuildPoolForecast(in PoolForecastInput) PoolForecast {
 
 	resets := make([]PoolNextReset, len(slots))
 	for slot, i := range slotAccount {
-		resets[slot] = PoolNextReset{Email: in.Accounts[i].Email, At: slots[slot].reset.UTC().Truncate(time.Second)}
+		resets[slot] = PoolNextReset{Email: current[i].Email, At: slots[slot].reset.UTC().Truncate(time.Second)}
 	}
-	out.Alerts = append(out.Alerts, poolSignInAlerts(in.Accounts, out.Accounts)...)
+	out.Alerts = append(out.Alerts, poolSignInAlerts(current, out.Accounts)...)
 	if alert, ok := poolRunsOutAlert(out.Pool, resets, now); ok {
 		out.Alerts = append(out.Alerts, alert)
 	}
@@ -342,7 +351,8 @@ func poolAccountStates(accounts []PoolAccount, limits resetLimits, now time.Time
 }
 
 // poolExcludedState returns the state of an account the pool leaves out, or ""
-// for an account in the pool.
+// for an account in the pool. It reads the account as poolAccountAt returns it,
+// so only an account without a known seven-day reset is no-data.
 func poolExcludedState(account PoolAccount, now time.Time) string {
 	switch {
 	case account.Disabled:
@@ -353,6 +363,39 @@ func poolExcludedState(account PoolAccount, now time.Time) string {
 		return PoolStateNoData
 	}
 	return ""
+}
+
+// poolAccountAt returns the account with each window whose reset has passed by
+// now counted as reset: used 0, and the reset moved on by 7-day steps until it
+// is after now. A window without a reset time is left as it is.
+func poolAccountAt(account PoolAccount, now time.Time) PoolAccount {
+	if account.SevenDay != nil {
+		window := *account.SevenDay
+		window.Utilization, window.ResetsAt = poolRollWindow(window.Utilization, window.ResetsAt, now)
+		account.SevenDay = &window
+	}
+	if len(account.Models) > 0 {
+		models := make([]ScopedWindow, len(account.Models))
+		for i, model := range account.Models {
+			model.Utilization, model.ResetsAt = poolRollWindow(model.Utilization, model.ResetsAt, now)
+			models[i] = model
+		}
+		account.Models = models
+	}
+	return account
+}
+
+// poolRollWindow is a window's used fraction and reset at a later time: 0 once
+// the reset has passed, with the reset moved on by 7-day steps until it is
+// after at. A zero reset is unknown and is returned unchanged.
+func poolRollWindow(used float64, reset, at time.Time) (float64, time.Time) {
+	if reset.IsZero() || reset.After(at) {
+		return used, reset
+	}
+	for !reset.After(at) {
+		reset = reset.Add(poolSevenDays)
+	}
+	return 0, reset
 }
 
 func poolFableWindow(models []ScopedWindow, now time.Time) (ScopedWindow, bool) {
@@ -597,7 +640,7 @@ func poolHistoryPoints(history []PoolSample, now time.Time) []PoolHistoryPoint {
 				continue
 			}
 			counted++
-			used, _ := poolUsedAt(sample, at)
+			used, _ := poolRollWindow(sample.Used, sample.ResetsAt, at)
 			point.Remaining += 1 - used
 			if sample.FableUsed != nil {
 				fable := *sample.FableUsed
@@ -627,21 +670,10 @@ func poolSampleAt(samples []PoolSample, at time.Time) (PoolSample, bool) {
 	return samples[index], true
 }
 
-// poolUsedAt is a sample's utilization at a later time: 0 once its reset has
-// passed, with the reset moved on by 7-day steps.
-func poolUsedAt(sample PoolSample, at time.Time) (float64, time.Time) {
-	reset := sample.ResetsAt
-	if reset.IsZero() || reset.After(at) {
-		return sample.Used, reset
-	}
-	for !reset.After(at) {
-		reset = reset.Add(poolSevenDays)
-	}
-	return 0, reset
-}
-
 // PoolAccountsFromHistory rebuilds each account's state at now from stored
-// samples, for a replay of the forecast over past data.
+// samples, for a replay of the forecast over past data. Like the live hub, it
+// keeps each account's latest sample at any age, counted as reset once its
+// reset has passed; an account without a known reset is left out.
 func PoolAccountsFromHistory(history []PoolSample, now time.Time) []PoolAccount {
 	byEmail := make(map[string][]PoolSample)
 	var emails []string
@@ -659,16 +691,16 @@ func PoolAccountsFromHistory(history []PoolSample, now time.Time) []PoolAccount 
 	for _, email := range emails {
 		samples := byEmail[email]
 		sortPoolSamples(samples)
-		sample, ok := poolSampleAt(samples, now)
-		if !ok || sample.ResetsAt.IsZero() {
+		sample := samples[len(samples)-1]
+		if sample.ResetsAt.IsZero() {
 			continue
 		}
-		used, reset := poolUsedAt(sample, now)
-		accounts = append(accounts, PoolAccount{
+		account := PoolAccount{
 			ID:       email,
 			Email:    email,
-			SevenDay: &ScopedWindow{Utilization: used, ResetsAt: reset, ObservedAt: sample.At},
-		})
+			SevenDay: &ScopedWindow{Utilization: sample.Used, ResetsAt: sample.ResetsAt, ObservedAt: sample.At},
+		}
+		accounts = append(accounts, poolAccountAt(account, now))
 	}
 	return accounts
 }
@@ -754,7 +786,9 @@ var poolSignInSeen = struct {
 	at map[string]time.Time
 }{at: make(map[string]time.Time)}
 
-// ClaudePoolAccounts reads the current state of each Claude OAuth account.
+// ClaudePoolAccounts reads the state of each Claude OAuth account. Its seven-day
+// window is the one routing reads, or, when routing has none because the reset
+// has passed, the last window the hub observed.
 func ClaudePoolAccounts(auths []*Auth, now time.Time) []PoolAccount {
 	accounts := make([]PoolAccount, 0, len(auths))
 	refused := make(map[string]struct{})
@@ -769,7 +803,11 @@ func ClaudePoolAccounts(auths []*Auth, now time.Time) []PoolAccount {
 			Disabled: auth.Disabled || auth.Status == StatusDisabled,
 			Models:   claudeModelWindows(auth.ID),
 		}
-		if window, ok := claudeSevenDayWindow(auth, now); ok {
+		window, ok := claudeSevenDayWindow(auth, now)
+		if !ok {
+			window, ok = claudeLastSevenDayWindow(auth)
+		}
+		if ok {
 			account.SevenDay = &window
 		}
 		if auth.RequiresSignIn || (auth.RefreshError != nil && strings.EqualFold(strings.TrimSpace(auth.RefreshError.Code), "invalid_grant")) {
@@ -792,6 +830,18 @@ func ClaudePoolAccounts(auths []*Auth, now time.Time) []PoolAccount {
 	return accounts
 }
 
+// claudeLastSevenDayWindow returns the newest seven-day window read for auth,
+// from the response headers or the usage poll, also when its reset has passed.
+func claudeLastSevenDayWindow(auth *Auth) (ScopedWindow, bool) {
+	polled, okPolled := claudeAccountWindowFor(auth.ID)
+	used, okUsed := parseUtilization(auth.Quota.Signals[claudeSevenDayUtilizationSignal])
+	reset, okReset := parseUnixSeconds(auth.Quota.Signals[claudeSevenDayResetSignal])
+	if okUsed && okReset && (!okPolled || !polled.ObservedAt.After(auth.Quota.ObservedAt)) {
+		return ScopedWindow{Utilization: used, ResetsAt: reset, ObservedAt: auth.Quota.ObservedAt}, true
+	}
+	return polled, okPolled
+}
+
 func poolSignInFirstSeen(authID string, now time.Time) time.Time {
 	poolSignInSeen.Lock()
 	defer poolSignInSeen.Unlock()
@@ -804,11 +854,12 @@ func poolSignInFirstSeen(authID string, now time.Time) time.Time {
 
 // ClaudePoolSamples reads one pool sample per Claude OAuth account in the pool,
 // keyed by the account's email, so the history sums the same accounts as
-// pool.remaining.
+// pool.remaining. A window whose reset has passed is sampled as reset.
 func ClaudePoolSamples(auths []*Auth, now time.Time) []PoolSample {
 	at := now.UTC().Truncate(PoolSampleInterval)
 	samples := make([]PoolSample, 0, len(auths))
-	for _, account := range ClaudePoolAccounts(auths, now) {
+	for _, observed := range ClaudePoolAccounts(auths, now) {
+		account := poolAccountAt(observed, now)
 		if account.Email == "" || poolExcludedState(account, now) != "" {
 			continue
 		}
