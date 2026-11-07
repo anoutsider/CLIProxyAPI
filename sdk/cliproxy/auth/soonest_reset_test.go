@@ -298,12 +298,25 @@ func TestSoonestResetSelectorDrainsAccountBeforeItsReset(t *testing.T) {
 	}
 }
 
+// The model window drains by its own reset time, never by the seven-day one.
 func TestSoonestResetSelectorDrainsModelWindowBeforeItsReset(t *testing.T) {
-	near := soonestResetAuth("a-near", "0.40", 12*time.Hour)
-	fresh := soonestResetAuth("b-fresh", "0.10", 4*24*time.Hour)
-	SetClaudeUsageWindows(near.ID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.95, ResetsAt: soonestResetNow.Add(12 * time.Hour)}})
-	t.Cleanup(func() { ClearClaudeScopedWindows(near.ID) })
-	if got := pickSoonest(t, &SoonestResetSelector{}, "claude-fable-5-1", near, fresh); got != "a-near" {
-		t.Fatalf("picked %q, want a-near: its Fable window resets within the drain window", got)
+	cases := []struct {
+		name                 string
+		sevenDayReset, fable time.Duration
+		want                 string
+	}{
+		{"fable resets within the drain window", 3 * 24 * time.Hour, 12 * time.Hour, "a-near"},
+		{"only the seven-day window resets within it", 12 * time.Hour, 3 * 24 * time.Hour, "b-fresh"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			near := soonestResetAuth("a-near", "0.40", tc.sevenDayReset)
+			fresh := soonestResetAuth("b-fresh", "0.10", 4*24*time.Hour)
+			SetClaudeUsageWindows(near.ID, nil, []ScopedWindow{{Name: "Fable", Utilization: 0.95, ResetsAt: soonestResetNow.Add(tc.fable)}})
+			t.Cleanup(func() { ClearClaudeScopedWindows(near.ID) })
+			if got := pickSoonest(t, &SoonestResetSelector{}, "claude-fable-5-1", near, fresh); got != tc.want {
+				t.Fatalf("picked %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
