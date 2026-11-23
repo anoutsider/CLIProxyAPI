@@ -1395,7 +1395,7 @@ func applyClaudeHeadersWithNativeProfile(
 		for _, beta := range strings.Split(baseBetas, ",") {
 			threadCapabilities = withClaudeBetaAppended(threadCapabilities, beta)
 		}
-		if advisorNeeded {
+		if advisorNeeded && !callerBetas[claudeAdvisorToolBeta] {
 			threadCapabilities = withClaudeAdvisorToolBeta(threadCapabilities)
 		}
 		baseBetas = threadCapabilities

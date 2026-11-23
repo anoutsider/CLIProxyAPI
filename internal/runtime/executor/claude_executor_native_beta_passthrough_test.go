@@ -38,6 +38,11 @@ func TestApplyClaudeHeaders_ConfirmedClientBetasForwardedUnchanged(t *testing.T)
 			betas: "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11",
 			body:  `{"model":"claude-opus-5-5","thinking":{"type":"adaptive"},"output_config":{"effort":"low"}}`,
 		},
+		{
+			name:  "opus main thread continuation",
+			betas: "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11",
+			body:  `{"model":"claude-opus-5-5","thinking":{"type":"adaptive"},"output_config":{"effort":"low"},"thread":{"type":"continue","previous_message_id":"msg_01"}}`,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			incoming := http.Header{}
