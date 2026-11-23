@@ -38,6 +38,21 @@ func TestApplyClaudeHeaders_ConfirmedClientBetasForwardedUnchanged(t *testing.T)
 			betas: "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11",
 			body:  `{"model":"claude-opus-5-5","thinking":{"type":"adaptive"},"output_config":{"effort":"low"}}`,
 		},
+		{
+			name:  "opus main thread continuation",
+			betas: "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11",
+			body:  `{"model":"claude-opus-5-5","thinking":{"type":"adaptive"},"output_config":{"effort":"low"},"thread":{"type":"continue","previous_message_id":"msg_01"}}`,
+		},
+		{
+			name:  "opus thinking disabled with display updates",
+			betas: "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11",
+			body:  `{"model":"claude-opus-5-5","thinking":{"type":"disabled"}}`,
+		},
+		{
+			name:  "haiku main with server-side fallback",
+			betas: "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,server-side-fallback-2026-06-01,extended-cache-ttl-2025-04-11",
+			body:  `{"model":"claude-haiku-5-5","thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}}`,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			incoming := http.Header{}
@@ -73,5 +88,41 @@ func TestApplyClaudeHeaders_ConfirmedClientStillGetsProxyBetasGated(t *testing.T
 	}
 	if strings.Contains(got, claudeEffortBeta) {
 		t.Fatalf("Anthropic-Beta = %q, want no effort beta the caller did not send", got)
+	}
+}
+
+// A confirmed native client keeps its own betas on requests where the proxy
+// gates the same beta off for its own credential: effort on a model or probe
+// without effort support, and fallback, display-updates and extended-cache-ttl
+// on a quota probe.
+func TestApplyClaudeHeaders_ConfirmedClientBetasSurviveProxyGating(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		betas string
+		body  string
+	}{
+		{
+			name:  "haiku 4.5 main with effort",
+			betas: "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,claude-code-20250219,per-turn-control-2026-07-01,advisor-tool-2026-03-01,effort-2025-11-24,extended-cache-ttl-2025-04-11",
+			body:  `{"model":"claude-haiku-4-5","thinking":{"type":"adaptive"}}`,
+		},
+		{
+			name:  "opus quota probe",
+			betas: "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,effort-2025-11-24,server-side-fallback-2026-06-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11",
+			body:  `{"model":"claude-opus-5-5","max_tokens":1}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			incoming := http.Header{}
+			incoming.Set("Anthropic-Beta", tt.betas)
+			req := newClaudeHeaderTestRequest(t, nil)
+			if err := applyClaudeHeadersWithNativeProfile(req, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, true, nil,
+				[]byte(tt.body), nil, incoming, true, false); err != nil {
+				t.Fatalf("applyClaudeHeadersWithNativeProfile() error = %v", err)
+			}
+			if got := req.Header.Get("Anthropic-Beta"); got != tt.betas {
+				t.Fatalf("Anthropic-Beta = %q, want the caller's list %q unchanged", got, tt.betas)
+			}
+		})
 	}
 }

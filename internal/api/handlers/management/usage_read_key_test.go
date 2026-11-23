@@ -56,6 +56,9 @@ func TestUsageReadKeyRestrictsManagementRequests(t *testing.T) {
 		}
 		c.String(http.StatusOK, body.URL)
 	})
+	// The usage read key is a /v0 grant; the same report under /v8 stays refused.
+	v8 := engine.Group("/v8/management", h.Middleware())
+	v8.GET("/observability/pool-forecast", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	apiCall := func(auth, method, url, extra string) string {
 		return `{"auth_index":"` + auths[auth].Index + `","method":"` + method + `","url":"` + url + `","header":{"Authorization":"Bearer $TOKEN$"}` + extra + `}`
@@ -84,6 +87,8 @@ func TestUsageReadKeyRestrictsManagementRequests(t *testing.T) {
 		{"credential of another provider", usageKey, http.MethodPost, "/v0/management/api-call", apiCall("codex", "GET", anthropicUsage, ""), http.StatusForbidden},
 		{"auth file download", usageKey, http.MethodGet, "/v0/management/auth-files/download?name=claude-1", "", http.StatusForbidden},
 		{"other route", usageKey, http.MethodGet, "/v0/management/config", "", http.StatusForbidden},
+		{"v8 pool forecast", usageKey, http.MethodGet, "/v8/management/observability/pool-forecast", "", http.StatusForbidden},
+		{"full key v8 pool forecast", fullKey, http.MethodGet, "/v8/management/observability/pool-forecast", "", http.StatusOK},
 		{"full key any url", fullKey, http.MethodPost, "/v0/management/api-call", apiCall("claude", "POST", "https://example.com/", ""), http.StatusOK},
 		{"full key other route", fullKey, http.MethodGet, "/v0/management/config", "", http.StatusOK},
 	}
