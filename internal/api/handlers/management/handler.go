@@ -21,7 +21,6 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/crypto/bcrypt"
 )
 
 type attemptInfo struct {
@@ -61,8 +60,10 @@ type Handler struct {
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
 	pluginReleases          pluginReleaseCache
-	siwcOAuthFactory        func(*config.Config) siwcOAuthService
+	authCache               managementAuthCache
+	siwcOAuthFactory        func(*config.Config, string) siwcOAuthService
 	siwcCommitMu            sync.Mutex
+	v8AuthUploadMu          sync.Mutex
 	pluginLoginSaveMu       sync.Mutex
 }
 
@@ -138,14 +139,45 @@ func (h *Handler) SetConfig(cfg *config.Config) {
 		log.Debug("management: ignoring config reload parsed from an older config file version")
 		return
 	}
+	prevSecretHash := ""
+	if h.cfg != nil {
+		prevSecretHash = h.cfg.RemoteManagement.SecretKey
+	}
 	h.cfg = cloned
+	nextSecretHash := ""
+	if cloned != nil {
+		nextSecretHash = cloned.RemoteManagement.SecretKey
+	}
+	if prevSecretHash != nextSecretHash {
+		h.authCache.invalidate()
+	}
 }
 
-// configSnapshot reads h.cfg under h.mu, for code that runs outside the request holding it.
+// configSnapshot returns an independent copy of h.cfg under h.mu, for code that runs outside the request holding it.
 func (h *Handler) configSnapshot() *config.Config {
+	if h == nil {
+		return nil
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.cfg
+	if h.cfg == nil {
+		return nil
+	}
+	if cloned := h.cfg.CloneForRuntime(); cloned != nil {
+		return cloned
+	}
+	copied := *h.cfg
+	return &copied
+}
+
+// pluginHostSnapshot reads h.pluginHost under h.mu.
+func (h *Handler) pluginHostSnapshot() *pluginhost.Host {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.pluginHost
 }
 
 // oauthConfigWithProxy returns a configuration snapshot for an OAuth session.
@@ -162,13 +194,8 @@ func (h *Handler) oauthConfigWithProxy(proxyURL string) *config.Config {
 			SDKConfig: config.SDKConfig{ProxyURL: proxyURL},
 		}
 	}
-	cloned := cfg.CloneForRuntime()
-	if cloned == nil {
-		copied := *cfg
-		cloned = &copied
-	}
-	cloned.ProxyURL = proxyURL
-	return cloned
+	cfg.ProxyURL = proxyURL
+	return cfg
 }
 
 // isStaleConfigFileSnapshotLocked reports whether cfg was parsed from config file
@@ -456,10 +483,10 @@ func (h *Handler) authenticateManagementKey(clientIP string, localClient bool, p
 
 	// A usage read key that equals any full credential would hand full access to
 	// whoever holds the read key, so neither is accepted until they differ.
-	if usageReadHash != "" && bcrypt.CompareHashAndPassword([]byte(usageReadHash), []byte(provided)) == nil {
+	if usageReadHash != "" && h.authCache.verify(usageReadHash, provided) {
 		collides := (envSecret != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(envSecret)) == 1) ||
 			(h.localPassword != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(h.localPassword)) == 1) ||
-			(secretHash != "" && bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) == nil)
+			(secretHash != "" && h.authCache.verify(secretHash, provided))
 		if collides {
 			return managementKeyNone, http.StatusForbidden, "usage-read-key must differ from every full management key"
 		}
@@ -481,7 +508,7 @@ func (h *Handler) authenticateManagementKey(clientIP string, localClient bool, p
 		return managementKeyFull, 0, ""
 	}
 
-	if secretHash != "" && bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) == nil {
+	if secretHash != "" && h.authCache.verify(secretHash, provided) {
 		reset()
 		return managementKeyFull, 0, ""
 	}
