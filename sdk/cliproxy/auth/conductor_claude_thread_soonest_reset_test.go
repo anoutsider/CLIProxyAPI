@@ -35,7 +35,7 @@ func newClaudeThreadSoonestResetHub(t *testing.T, model string, ownerUsed float6
 	hub := &claudeThreadSoonestResetHub{caller: t.Name() + "-" + uuid.NewString()}
 	hub.manager = NewManager(nil, selector, nil)
 	hub.manager.SetRetryConfig(0, 0, 0)
-	hub.owner, hub.soon, hub.late = hub.caller+"-a-owner", hub.caller+"-b-soon", hub.caller+"-c-late"
+	hub.owner, hub.soon, hub.late = hub.caller+"-a-owner", hub.caller+"-c-soon", hub.caller+"-b-late"
 	windows := map[string]ScopedWindow{
 		hub.owner: {Utilization: ownerUsed, ResetsAt: time.Now().Add(3 * 24 * time.Hour)},
 		hub.soon:  {Utilization: 0.40, ResetsAt: time.Now().Add(4 * 24 * time.Hour)},
